@@ -111,8 +111,7 @@ pub fn groth16_verify<C: CircuitContext>(
     Fq12::equal_constant(circuit, &f, &Fq12::as_montgomery(alpha_beta))
 }
 
-/// Convenience wrapper: verify using compressed A and C (x, y_flag). B remains host-provided `G2Affine`.
-/// Includes optimization for empty public inputs to avoid unnecessary MSM computation.
+/// Verify a 128-byte compressed serialized groth16 proof using public inputs
 pub fn groth16_verify_compressed<C: CircuitContext>(
     circuit: &mut C,
     input: &Groth16VerifyCompressedInputWires,
@@ -132,8 +131,8 @@ pub fn groth16_verify_compressed<C: CircuitContext>(
 
     let valid = circuit.issue_wire();
     circuit.add_gate(crate::Gate {
-        wire_a: verified_res,
-        wire_b: proof.valid,
+        wire_a: verified_res, // proof verification was successful
+        wire_b: proof.valid,  // input is valid
         wire_c: valid,
         gate_type: crate::GateType::And,
     });
@@ -272,6 +271,7 @@ pub struct Groth16VerifyCompressedInput {
     pub vk: VerifyingKey<Bn254>,
 }
 
+/// Compressed groth16 proof with public inputs
 #[derive(Debug)]
 pub struct Groth16VerifyCompressedInputWires {
     pub public: Vec<Fr>,
@@ -279,9 +279,12 @@ pub struct Groth16VerifyCompressedInputWires {
     pub vk: VerifyingKey<Bn254>,
 }
 
+/// Serialized 128 byte representation of groth16 proof in arkworks' serialized format
 #[derive(Debug, Clone, Copy)]
 pub struct SerializedCompressedProofWires(pub [WireId; 128 * 8]);
 
+/// Groth16 Proof elements `{a, b, c}` along with `valid` flag indicating whether the
+/// input (i.e. `SerializedCompressedProofWires`), from which this was obtained, was valid to begin with.
 #[derive(Debug, Clone)]
 pub struct DeserializedCompressedProofWires {
     a: G1Projective,

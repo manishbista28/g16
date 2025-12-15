@@ -6,7 +6,7 @@ use circuit_component_macro::component;
 
 use crate::{
     CircuitContext, WireId,
-    circuit::{FromWires, WiresArity, WiresObject},
+    circuit::{FromWires, TRUE_WIRE, WiresArity, WiresObject},
     gadgets::{
         bigint::{self, BigIntWires, Error},
         bn254::{fp254impl::Fp254Impl, fq::Fq, fq2::Fq2, fr::Fr},
@@ -526,22 +526,18 @@ impl G2Projective {
         }
     }
 
-    /// Deserialize into G1Projective from its 32 byte serialized bit representation.
+    /// Deserialize into G2Projective from its 64 byte serialized bit representation.
+    // Follows arkworks implementation here:
+    // https://github.com/arkworks-rs/algebra/blob/v0.5.0/ec/src/models/short_weierstrass/mod.rs#L145
     pub fn deserialize_checked<C: CircuitContext>(
         circuit: &mut C,
         serialized_bits: [WireId; 64 * 8],
     ) -> DecompressedG2Wires {
         let (x, flag) = {
-            let byte_arr: Vec<[WireId; 8]> = serialized_bits
-                .chunks(8)
-                .map(|c| c.try_into().expect("chunk is exactly 8"))
-                .collect();
-            // flatten byte_array
-            let bit_arr: Vec<WireId> = byte_arr.into_iter().flatten().collect();
             let (num1, num2, flag) = (
-                &bit_arr[0..Fq::N_BITS],
-                &bit_arr[32 * 8..32 * 8 + Fq::N_BITS],
-                &bit_arr[32 * 8 + Fq::N_BITS..],
+                &serialized_bits[0..Fq::N_BITS],
+                &serialized_bits[32 * 8..32 * 8 + Fq::N_BITS],
+                &serialized_bits[32 * 8 + Fq::N_BITS..],
             );
             let a = Fq2([
                 Fq(BigIntWires {
@@ -552,26 +548,74 @@ impl G2Projective {
                 }),
             ]);
 
+            // convert input field element in standard form into montgomery form
             let r = Fq::as_montgomery(ark_bn254::Fq::ONE);
             let a_mont_x = Fq::mul_by_constant_montgomery(circuit, a.c0(), &r.square());
             let r = Fq::as_montgomery(ark_bn254::Fq::ONE);
             let a_mont_y = Fq::mul_by_constant_montgomery(circuit, a.c1(), &r.square());
 
-            (Fq2([a_mont_x, a_mont_y]), flag.to_vec())
+            // flag_0 is lsb, flag 1 is msb
+            (Fq2([a_mont_x, a_mont_y]), [flag[0], flag[1]])
         };
 
-        let y_neg_flag = circuit.issue_wire();
-        circuit.add_gate(crate::Gate {
-            wire_a: flag[0],
-            wire_b: flag[1],
-            wire_c: y_neg_flag,
-            gate_type: crate::GateType::Or,
-        });
+        // Part 1: Extract Flags
+
+        let is_y_positive = {
+            // In arkworks, given:
+            // const Y_IS_POSITIVE: u8 = 0;
+            let flag_or = circuit.issue_wire();
+            circuit.add_gate(crate::Gate {
+                wire_a: flag[0],
+                wire_b: flag[1],
+                wire_c: flag_or,
+                gate_type: crate::GateType::Or,
+            });
+            let flag_nor = circuit.issue_wire();
+            circuit.add_gate(crate::Gate {
+                wire_a: flag_or,
+                wire_b: TRUE_WIRE,
+                wire_c: flag_nor,
+                gate_type: crate::GateType::Xor,
+            });
+            flag_nor
+        };
+
+        let is_y_negative = {
+            // In arkworks, given:
+            // const Y_IS_NEGATIVE: u8 = 1 << 7;
+            let tmp0 = circuit.issue_wire();
+            circuit.add_gate(crate::Gate {
+                wire_a: flag[0],
+                wire_b: TRUE_WIRE,
+                wire_c: tmp0,
+                gate_type: crate::GateType::Xor,
+            });
+            let tmp1 = circuit.issue_wire();
+            circuit.add_gate(crate::Gate {
+                wire_a: flag[1],
+                wire_b: tmp0,
+                wire_c: tmp1,
+                gate_type: crate::GateType::And,
+            });
+            tmp1
+        };
+
+        // rest of the flags (11 and 01) represent identity and None, so are invalid flags
+        let flags_is_valid = {
+            let tmp0 = circuit.issue_wire();
+            circuit.add_gate(crate::Gate {
+                wire_a: is_y_positive,
+                wire_b: is_y_negative,
+                wire_c: tmp0,
+                gate_type: crate::GateType::Or,
+            });
+            tmp0
+        };
+
+        // Part 2: compute (X, Y, Z)
 
         let x2 = Fq2::square_montgomery(circuit, &x);
-
         let x3 = Fq2::mul_montgomery(circuit, &x2, &x);
-
         let y2 = Fq2::add_constant(
             circuit,
             &x3,
@@ -580,7 +624,8 @@ impl G2Projective {
 
         let y = Fq2::sqrt_general_montgomery(circuit, &y2);
         let rhs_is_qr = {
-            // check if y * y == y2 to ensure rhs was a quadratic residue to begin with
+            // check if y * y == y2 to ensure rhs was a quadratic residue to begin with,
+            // if it was not, then it means (x,y) is not a point on the curve
             let y_y = Fq2::square_montgomery(circuit, &y);
 
             let match_c0 = bigint::equal(circuit, y2.c0(), y_y.c0());
@@ -595,8 +640,8 @@ impl G2Projective {
             match_c0_and_c1
         };
 
+        // analogous to get_point_from_x_unchecked
         let neg_y = Fq2::neg(circuit, y.clone());
-
         let y_neg_greater = Fq2::greater_than(circuit, &neg_y, &y);
         let tsy = {
             let tsy_c0 = bigint::select(circuit, y.c0(), neg_y.c0(), y_neg_greater);
@@ -609,12 +654,25 @@ impl G2Projective {
             Fq2([Fq(tsy_neg_c0), Fq(tsy_neg_c1)])
         };
 
-        let final_y_0 = bigint::select(circuit, tsy_neg.c0(), tsy.c0(), y_neg_flag);
-        let final_y_1 = bigint::select(circuit, tsy_neg.c1(), tsy.c1(), y_neg_flag);
+        let final_y_0 = bigint::select(circuit, tsy_neg.c0(), tsy.c0(), is_y_negative);
+        let final_y_1 = bigint::select(circuit, tsy_neg.c1(), tsy.c1(), is_y_negative);
 
         // z = 1 in Montgomery
         let one_m = Fq::as_montgomery(ark_bn254::Fq::ONE);
         let zero_m = Fq::as_montgomery(ark_bn254::Fq::ZERO);
+
+        let input_is_valid = {
+            // Input is invalid if input is not a valid point in the curve or deserialization error
+            // valid only if both crieterion is met
+            let tmp0 = circuit.issue_wire();
+            circuit.add_gate(crate::Gate {
+                wire_a: rhs_is_qr,
+                wire_b: flags_is_valid,
+                wire_c: tmp0,
+                gate_type: crate::GateType::And,
+            });
+            tmp0
+        };
 
         DecompressedG2Wires {
             point: G2Projective {
@@ -626,7 +684,7 @@ impl G2Projective {
                     Fq::new_constant(&zero_m).unwrap(),
                 ]),
             },
-            is_valid: rhs_is_qr,
+            is_valid: input_is_valid,
         }
     }
 }
