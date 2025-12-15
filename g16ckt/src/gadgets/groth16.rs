@@ -5,24 +5,21 @@
 //! where `msm = vk.gamma_abc_g1[0] + sum_i(public[i] * vk.gamma_abc_g1[i+1])`.
 
 use ark_bn254::Bn254;
-use ark_ec::{AffineRepr, CurveGroup, models::short_weierstrass::SWCurveConfig, pairing::Pairing};
-use ark_ff::{AdditiveGroup, Field};
+use ark_ec::{AffineRepr, pairing::Pairing};
+use ark_ff::Field;
 use ark_groth16::VerifyingKey;
+use ark_serialize::CanonicalSerialize;
 use circuit_component_macro::component;
+use num_bigint::BigUint;
 
 use crate::{
-    CircuitContext, Fq2Wire, WireId,
+    CircuitContext, WireId,
     circuit::{CircuitInput, CircuitMode, EncodeInput, WiresObject},
     gadgets::{
-        bigint,
+        bigint::BigIntWires,
         bn254::{
-            G2Projective,
-            final_exponentiation::final_exponentiation_montgomery,
-            fq::Fq,
-            fq12::Fq12,
-            fr::Fr,
-            g1::{DecompressedG1Wires, G1Projective},
-            g2::DecompressedG2Wires,
+            G2Projective, final_exponentiation::final_exponentiation_montgomery, fq::Fq,
+            fq12::Fq12, fr::Fr, g1::G1Projective,
             pairing::multi_miller_loop_groth16_evaluate_montgomery_fast,
         },
     },
@@ -114,202 +111,21 @@ pub fn groth16_verify<C: CircuitContext>(
     Fq12::equal_constant(circuit, &f, &Fq12::as_montgomery(alpha_beta))
 }
 
-/// Decompress a compressed G1 point (x, sign bit) into projective wires with z = 1 (Montgomery domain).
-/// - `x_m`: x-coordinate in Montgomery form wires
-/// - `y_flag`: boolean wire selecting the correct sqrt branch for y
-#[component]
-pub fn decompress_g1_from_compressed<C: CircuitContext>(
-    circuit: &mut C,
-    compressed: &CompressedG1Wires,
-) -> DecompressedG1Wires {
-    let CompressedG1Wires { x_m, y_flag } = compressed.clone();
-
-    // rhs = x^3 + b (Montgomery domain)
-    let x2 = Fq::square_montgomery(circuit, &x_m);
-    let x3 = Fq::mul_montgomery(circuit, &x2, &x_m);
-    let b_m = Fq::as_montgomery(ark_bn254::g1::Config::COEFF_B);
-    let rhs = Fq::add_constant(circuit, &x3, &b_m);
-
-    // sy = sqrt(rhs) in Montgomery domain
-    let sy = Fq::sqrt_montgomery(circuit, &rhs);
-    // check if sy * sy == rhs to ensure rhs was a quadratic residue to begin with
-    let sy_sy = Fq::square_montgomery(circuit, &sy);
-    let rhs_is_qr = bigint::equal(circuit, &sy_sy, &rhs);
-
-    let sy_neg = Fq::neg(circuit, &sy);
-    let y_bits = bigint::select(circuit, &sy.0, &sy_neg.0, y_flag);
-    let y = Fq(y_bits);
-
-    // z = 1 in Montgomery
-    let one_m = Fq::as_montgomery(ark_bn254::Fq::ONE);
-    let z = Fq::new_constant(&one_m).expect("const one mont");
-
-    DecompressedG1Wires {
-        point: G1Projective {
-            x: x_m.clone(),
-            y,
-            z,
-        },
-        is_valid: rhs_is_qr,
-    }
-}
-
-#[component]
-pub fn decompress_g2_from_compressed<C: CircuitContext>(
-    circuit: &mut C,
-    compressed: &CompressedG2Wires,
-) -> DecompressedG2Wires {
-    let CompressedG2Wires { p: x, y_flag } = compressed;
-
-    let x2 = Fq2Wire::square_montgomery(circuit, x);
-
-    let x3 = Fq2Wire::mul_montgomery(circuit, &x2, x);
-
-    let y2 = Fq2Wire::add_constant(
-        circuit,
-        &x3,
-        &Fq2Wire::as_montgomery(ark_bn254::g2::Config::COEFF_B),
-    );
-
-    let y = Fq2Wire::sqrt_general_montgomery(circuit, &y2);
-    let rhs_is_qr = {
-        // check if y * y == y2 to ensure rhs was a quadratic residue to begin with
-        let y_y = Fq2Wire::square_montgomery(circuit, &y);
-
-        let match_c0 = bigint::equal(circuit, y2.c0(), y_y.c0());
-        let match_c1 = bigint::equal(circuit, y2.c1(), y_y.c1());
-        let match_c0_and_c1 = circuit.issue_wire();
-        circuit.add_gate(crate::Gate {
-            wire_a: match_c0,
-            wire_b: match_c1,
-            wire_c: match_c0_and_c1,
-            gate_type: crate::GateType::And,
-        });
-        match_c0_and_c1
-    };
-
-    let neg_y = Fq2Wire::neg(circuit, y.clone());
-
-    let final_y_0 = bigint::select(circuit, y.c0(), neg_y.c0(), *y_flag);
-    let final_y_1 = bigint::select(circuit, y.c1(), neg_y.c1(), *y_flag);
-
-    // z = 1 in Montgomery
-    let one_m = Fq::as_montgomery(ark_bn254::Fq::ONE);
-    let one_m = Fq::new_constant(&one_m).expect("const one mont");
-    let zero_m = Fq::as_montgomery(ark_bn254::Fq::ZERO);
-    let zero_m = Fq::new_constant(&zero_m).expect("const zero mont");
-
-    DecompressedG2Wires {
-        point: G2Projective {
-            x: x.clone(),
-            y: Fq2Wire([Fq(final_y_0), Fq(final_y_1)]),
-            // In Fq2, ONE is (c0=1, c1=0). Use Montgomery representation.
-            z: Fq2Wire([one_m, zero_m]),
-        },
-        is_valid: rhs_is_qr,
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct CompressedG1Wires {
-    pub x_m: Fq,
-    pub y_flag: WireId,
-}
-
-impl CompressedG1Wires {
-    pub fn new(mut issue: impl FnMut() -> WireId) -> Self {
-        Self {
-            x_m: Fq::new(&mut issue),
-            y_flag: issue(),
-        }
-    }
-}
-
-impl WiresObject for CompressedG1Wires {
-    fn to_wires_vec(&self) -> Vec<WireId> {
-        let Self { x_m: p, y_flag } = self;
-
-        let mut v = p.to_wires_vec();
-        v.push(*y_flag);
-        v
-    }
-
-    fn clone_from(&self, wire_gen: &mut impl FnMut() -> WireId) -> Self {
-        Self {
-            x_m: self.x_m.clone_from(wire_gen),
-            y_flag: self.y_flag.clone_from(wire_gen),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CompressedG2Wires {
-    pub p: Fq2Wire,
-    pub y_flag: WireId,
-}
-
-impl CompressedG2Wires {
-    pub fn new(mut issue: impl FnMut() -> WireId) -> Self {
-        Self {
-            p: Fq2Wire::new(&mut issue),
-            y_flag: issue(),
-        }
-    }
-}
-
-impl WiresObject for CompressedG2Wires {
-    fn to_wires_vec(&self) -> Vec<WireId> {
-        let Self { p, y_flag } = self;
-
-        let mut v = p.to_wires_vec();
-        v.push(*y_flag);
-        v
-    }
-
-    fn clone_from(&self, wire_gen: &mut impl FnMut() -> WireId) -> Self {
-        Self {
-            p: self.p.clone_from(wire_gen),
-            y_flag: self.y_flag.clone_from(wire_gen),
-        }
-    }
-}
-
 /// Convenience wrapper: verify using compressed A and C (x, y_flag). B remains host-provided `G2Affine`.
 /// Includes optimization for empty public inputs to avoid unnecessary MSM computation.
 pub fn groth16_verify_compressed<C: CircuitContext>(
     circuit: &mut C,
     input: &Groth16VerifyCompressedInputWires,
 ) -> crate::WireId {
-    let a = decompress_g1_from_compressed(circuit, &input.a);
-    let b = decompress_g2_from_compressed(circuit, &input.b);
-    let c = decompress_g1_from_compressed(circuit, &input.c);
-
-    let valid_decompressed = {
-        let tmp0 = circuit.issue_wire();
-        let tmp1 = circuit.issue_wire();
-
-        circuit.add_gate(crate::Gate {
-            wire_a: a.is_valid,
-            wire_b: b.is_valid,
-            wire_c: tmp0,
-            gate_type: crate::GateType::And,
-        });
-        circuit.add_gate(crate::Gate {
-            wire_a: tmp0,
-            wire_b: c.is_valid,
-            wire_c: tmp1,
-            gate_type: crate::GateType::And,
-        });
-        tmp1
-    };
+    let proof = input.proof.deserialize_checked(circuit);
 
     let verified_res = groth16_verify(
         circuit,
         &Groth16VerifyInputWires {
             public: input.public.clone(),
-            a: a.point,
-            b: b.point,
-            c: c.point,
+            a: proof.a,
+            b: proof.b,
+            c: proof.c,
             vk: input.vk.clone(),
         },
     );
@@ -317,7 +133,7 @@ pub fn groth16_verify_compressed<C: CircuitContext>(
     let valid = circuit.issue_wire();
     circuit.add_gate(crate::Gate {
         wire_a: verified_res,
-        wire_b: valid_decompressed,
+        wire_b: proof.valid,
         wire_c: valid,
         gate_type: crate::GateType::And,
     });
@@ -427,19 +243,103 @@ impl<M: CircuitMode<WireValue = bool>> EncodeInput<M> for Groth16VerifyInput {
 
 impl Groth16VerifyInput {
     pub fn compress(self) -> Groth16VerifyCompressedInput {
-        Groth16VerifyCompressedInput(self)
+        let public = self.public.into_iter().map(|x| x.into()).collect();
+        let mut proof_bytes = Vec::new();
+        ark_groth16::Proof::<Bn254> {
+            a: self.a.into(),
+            b: self.b.into(),
+            c: self.c.into(),
+        }
+        .serialize_compressed(&mut proof_bytes)
+        .expect("serialize proof");
+        let proof_bits: Vec<bool> = proof_bytes
+            .iter()
+            .flat_map(|&b| (0..8).map(move |i| ((b >> i) & 1) == 1))
+            .collect();
+        Groth16VerifyCompressedInput {
+            public,
+            proof: proof_bits.try_into().unwrap(),
+            vk: self.vk,
+        }
     }
 }
 
-pub struct Groth16VerifyCompressedInput(pub Groth16VerifyInput);
+type SerializedCompressedProof = [bool; 128 * 8];
+/// Compressed representation of groth16 proof
+pub struct Groth16VerifyCompressedInput {
+    pub public: Vec<BigUint>,
+    pub proof: SerializedCompressedProof, // 128 byte proof
+    pub vk: VerifyingKey<Bn254>,
+}
 
 #[derive(Debug)]
 pub struct Groth16VerifyCompressedInputWires {
     pub public: Vec<Fr>,
-    pub a: CompressedG1Wires,
-    pub b: CompressedG2Wires,
-    pub c: CompressedG1Wires,
+    pub proof: SerializedCompressedProofWires,
     pub vk: VerifyingKey<Bn254>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SerializedCompressedProofWires(pub [WireId; 128 * 8]);
+
+#[derive(Debug, Clone)]
+pub struct DeserializedCompressedProofWires {
+    a: G1Projective,
+    b: G2Projective,
+    c: G1Projective,
+    valid: WireId,
+}
+
+impl SerializedCompressedProofWires {
+    pub fn new(issue: &mut impl FnMut() -> WireId) -> Self {
+        let v: Vec<WireId> = std::iter::repeat_with(issue).take(128 * 8).collect();
+        let v: [WireId; 128 * 8] = v.try_into().unwrap();
+        Self(v)
+    }
+    pub fn deserialize_checked<C: CircuitContext>(
+        &self,
+        circuit: &mut C,
+    ) -> DeserializedCompressedProofWires {
+        let compressed_a: [WireId; 32 * 8] = self.0[0..32 * 8].try_into().unwrap();
+        let compressed_b: [WireId; 64 * 8] = self.0[32 * 8..96 * 8].try_into().unwrap();
+        let compressed_c: [WireId; 32 * 8] = self.0[96 * 8..].try_into().unwrap();
+
+        let a_decomp = G1Projective::deserialize_checked(circuit, compressed_a);
+        let b_decomp = G2Projective::deserialize_checked(circuit, compressed_b);
+        let c_decomp = G1Projective::deserialize_checked(circuit, compressed_c);
+
+        let ab_valid = circuit.issue_wire();
+        let abc_valid = circuit.issue_wire();
+
+        circuit.add_gate(crate::Gate {
+            wire_a: a_decomp.is_valid,
+            wire_b: b_decomp.is_valid,
+            wire_c: ab_valid,
+            gate_type: crate::GateType::And,
+        });
+        circuit.add_gate(crate::Gate {
+            wire_a: ab_valid,
+            wire_b: c_decomp.is_valid,
+            wire_c: abc_valid,
+            gate_type: crate::GateType::And,
+        });
+
+        DeserializedCompressedProofWires {
+            a: a_decomp.point,
+            b: b_decomp.point,
+            c: c_decomp.point,
+            valid: abc_valid,
+        }
+    }
+}
+
+impl WiresObject for SerializedCompressedProofWires {
+    fn to_wires_vec(&self) -> Vec<WireId> {
+        self.0.to_vec()
+    }
+    fn clone_from(&self, wire_gen: &mut impl FnMut() -> WireId) -> Self {
+        SerializedCompressedProofWires::new(wire_gen)
+    }
 }
 
 impl WiresObject for Groth16VerifyCompressedInputWires {
@@ -450,9 +350,7 @@ impl WiresObject for Groth16VerifyCompressedInputWires {
     fn clone_from(&self, mut issue: &mut impl FnMut() -> WireId) -> Self {
         Groth16VerifyCompressedInputWires {
             public: self.public.iter().map(|_| Fr::new(&mut issue)).collect(),
-            a: CompressedG1Wires::new(&mut issue),
-            b: CompressedG2Wires::new(&mut issue),
-            c: CompressedG1Wires::new(&mut issue),
+            proof: self.proof.clone_from(issue),
             vk: self.vk.clone(),
         }
     }
@@ -463,11 +361,9 @@ impl CircuitInput for Groth16VerifyCompressedInput {
 
     fn allocate(&self, mut issue: impl FnMut() -> WireId) -> Self::WireRepr {
         Groth16VerifyCompressedInputWires {
-            public: self.0.public.iter().map(|_| Fr::new(&mut issue)).collect(),
-            a: CompressedG1Wires::new(&mut issue),
-            b: CompressedG2Wires::new(&mut issue),
-            c: CompressedG1Wires::new(&mut issue),
-            vk: self.0.vk.clone(),
+            public: self.public.iter().map(|_| Fr::new(&mut issue)).collect(),
+            proof: SerializedCompressedProofWires::new(&mut issue),
+            vk: self.vk.clone(),
         }
     }
     fn collect_wire_ids(repr: &Self::WireRepr) -> Vec<crate::WireId> {
@@ -475,9 +371,7 @@ impl CircuitInput for Groth16VerifyCompressedInput {
         for s in &repr.public {
             ids.extend(s.to_wires_vec());
         }
-        ids.extend(repr.a.to_wires_vec());
-        ids.extend(repr.b.to_wires_vec());
-        ids.extend(repr.c.to_wires_vec());
+        ids.extend(repr.proof.to_wires_vec());
         ids
     }
 }
@@ -485,8 +379,8 @@ impl CircuitInput for Groth16VerifyCompressedInput {
 impl<M: CircuitMode<WireValue = bool>> EncodeInput<M> for Groth16VerifyCompressedInput {
     fn encode(&self, repr: &Groth16VerifyCompressedInputWires, cache: &mut M) {
         // Encode public scalars
-        for (w, v) in repr.public.iter().zip(self.0.public.iter()) {
-            let fr_fn = Fr::get_wire_bits_fn(w, v).unwrap();
+        for (w, v) in repr.public.iter().zip(self.public.iter()) {
+            let fr_fn = BigIntWires::get_wire_bits_fn(w, v).unwrap();
 
             for &wire in w.iter() {
                 if let Some(bit) = fr_fn(wire) {
@@ -495,73 +389,32 @@ impl<M: CircuitMode<WireValue = bool>> EncodeInput<M> for Groth16VerifyCompresse
             }
         }
 
-        // Compute compression from standard affine coords; feed Montgomery x + flag
-        let a_aff_std = self.0.a.into_affine();
-        let b_aff_std = self.0.b.into_affine();
-        let c_aff_std = self.0.c.into_affine();
-
-        let a_flag = (a_aff_std.y.square())
-            .sqrt()
-            .expect("y^2 must be QR")
-            .eq(&a_aff_std.y);
-        let b_flag = (b_aff_std.y.square())
-            .sqrt()
-            .expect("y^2 must be QR in Fq2")
-            .eq(&b_aff_std.y);
-        let c_flag = (c_aff_std.y.square())
-            .sqrt()
-            .expect("y^2 must be QR")
-            .eq(&c_aff_std.y);
-
-        let a_x_m = Fq::as_montgomery(a_aff_std.x);
-        let b_x_m = Fq2Wire::as_montgomery(b_aff_std.x);
-        let c_x_m = Fq::as_montgomery(c_aff_std.x);
-
-        // Feed A.x (Montgomery) bits and flag
-        let a_x_fn = Fq::get_wire_bits_fn(&repr.a.x_m, &a_x_m).unwrap();
-        for &wire_id in repr.a.x_m.iter() {
-            if let Some(bit) = a_x_fn(wire_id) {
-                cache.feed_wire(wire_id, bit);
-            }
-        }
-        cache.feed_wire(repr.a.y_flag, a_flag);
-
-        // Feed B.x (Montgomery) bits and flag (Fq2 as c0||c1)
-        let b_x_fn = Fq2Wire::get_wire_bits_fn(&repr.b.p, &b_x_m).unwrap();
-        for &wire_id in repr.b.p.iter() {
-            if let Some(bit) = b_x_fn(wire_id) {
-                cache.feed_wire(wire_id, bit);
-            }
-        }
-        cache.feed_wire(repr.b.y_flag, b_flag);
-
-        // Feed C.x (Montgomery) bits and flag
-        let c_x_fn = Fq::get_wire_bits_fn(&repr.c.x_m, &c_x_m).unwrap();
-        for &wire_id in repr.c.x_m.iter() {
-            if let Some(bit) = c_x_fn(wire_id) {
-                cache.feed_wire(wire_id, bit);
-            }
-        }
-        cache.feed_wire(repr.c.y_flag, c_flag);
+        self.proof.iter().zip(repr.proof.0).for_each(|(x, y)| {
+            cache.feed_wire(y, *x);
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use ark_ec::{AffineRepr, CurveGroup, PrimeGroup};
+    use ark_ec::{AffineRepr, CurveGroup, PrimeGroup, short_weierstrass::SWCurveConfig};
     use ark_ff::UniformRand;
     use ark_groth16::Groth16;
     use ark_relations::{
         lc,
         r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError},
     };
+    use ark_serialize::CanonicalDeserialize;
     use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha20Rng;
     use test_log::test;
 
     use super::*;
-    use crate::circuit::{CircuitBuilder, CircuitMode, EncodeInput, StreamingResult};
+    use crate::{
+        Fq2Wire,
+        circuit::{CircuitBuilder, StreamingResult},
+    };
 
     // Helper to reduce duplication across bitflip tests for A, B, and C
     fn run_false_bitflip_test(seed: u64, mutate: impl FnOnce(&mut Groth16VerifyInput)) {
@@ -878,174 +731,6 @@ mod tests {
         assert!(!out.output_value);
     }
 
-    // Minimal harnesses that allocate compressed wires and feed them directly
-    struct OnlyCompressedG1Input(ark_bn254::G1Affine);
-    impl crate::circuit::CircuitInput for OnlyCompressedG1Input {
-        type WireRepr = CompressedG1Wires;
-        fn allocate(&self, mut issue: impl FnMut() -> WireId) -> Self::WireRepr {
-            CompressedG1Wires::new(&mut issue)
-        }
-        fn collect_wire_ids(repr: &Self::WireRepr) -> Vec<WireId> {
-            repr.to_wires_vec()
-        }
-    }
-    impl<M: CircuitMode<WireValue = bool>> EncodeInput<M> for OnlyCompressedG1Input {
-        fn encode(&self, repr: &CompressedG1Wires, cache: &mut M) {
-            let p = self.0;
-            let x_m = Fq::as_montgomery(p.x);
-            let s = (p.y.square()).sqrt().expect("y^2 must be QR");
-            let y_flag = s == p.y;
-
-            let x_fn = Fq::get_wire_bits_fn(&repr.x_m, &x_m).unwrap();
-            for &w in repr.x_m.iter() {
-                if let Some(bit) = x_fn(w) {
-                    cache.feed_wire(w, bit);
-                }
-            }
-            cache.feed_wire(repr.y_flag, y_flag);
-        }
-    }
-
-    struct OnlyCompressedG2Input(ark_bn254::G2Affine);
-    impl crate::circuit::CircuitInput for OnlyCompressedG2Input {
-        type WireRepr = CompressedG2Wires;
-        fn allocate(&self, mut issue: impl FnMut() -> WireId) -> Self::WireRepr {
-            CompressedG2Wires::new(&mut issue)
-        }
-        fn collect_wire_ids(repr: &Self::WireRepr) -> Vec<WireId> {
-            repr.to_wires_vec()
-        }
-    }
-    impl<M: CircuitMode<WireValue = bool>> EncodeInput<M> for OnlyCompressedG2Input {
-        fn encode(&self, repr: &CompressedG2Wires, cache: &mut M) {
-            let p = self.0;
-            let x_m = Fq2Wire::as_montgomery(p.x);
-            // Simple off-circuit compression flag: sqrt(y^2) == y
-            let s = (p.y.square()).sqrt().expect("y^2 must be QR in Fq2");
-            let y_flag = s == p.y;
-
-            let x_fn = Fq2Wire::get_wire_bits_fn(&repr.p, &x_m).unwrap();
-            for &w in repr.p.iter() {
-                if let Some(bit) = x_fn(w) {
-                    cache.feed_wire(w, bit);
-                }
-            }
-            cache.feed_wire(repr.y_flag, y_flag);
-        }
-    }
-
-    #[test]
-    fn test_g1_compress_decompress_matches() {
-        let mut rng = ChaCha20Rng::seed_from_u64(111);
-        let r = ark_bn254::Fr::rand(&mut rng);
-        let p = (ark_bn254::G1Projective::generator() * r).into_affine();
-
-        let input = OnlyCompressedG1Input(p);
-
-        let out: crate::circuit::StreamingResult<_, _, Vec<bool>> =
-            CircuitBuilder::streaming_execute(input, 10_000, |ctx, wires| {
-                let res = decompress_g1_from_compressed(ctx, wires);
-                let dec = res.point;
-
-                let exp = G1Projective::as_montgomery(p.into_group());
-                let x_ok = Fq::equal_constant(ctx, &dec.x, &exp.x);
-                let z_ok = Fq::equal_constant(ctx, &dec.z, &exp.z);
-                // Compare y up to sign by checking y^2 equality
-                let y_sq = Fq::square_montgomery(ctx, &dec.y);
-                let exp_y_std = Fq::from_montgomery(exp.y);
-                let exp_y_sq_m = Fq::as_montgomery(exp_y_std.square());
-                let y_ok = Fq::equal_constant(ctx, &y_sq, &exp_y_sq_m);
-                vec![x_ok, y_ok, z_ok, res.is_valid]
-            });
-
-        assert!(out.output_value.iter().all(|&b| b));
-    }
-
-    #[test]
-    fn test_g1_decompress_failure() {
-        let mut rng = ChaCha20Rng::seed_from_u64(112);
-        for _ in 0..5 {
-            // sufficient sample size to sample both valid and invalid points
-            let x = ark_bn254::Fq::rand(&mut rng);
-            let a1 = ark_bn254::Fq::sqrt(&((x * x * x) + ark_bn254::Fq::from(3)));
-            let (y, ref_is_valid) = if let Some(a1) = a1 {
-                // if it is possible to take square root, you have found correct y,
-                (a1, true)
-            } else {
-                // else generate some random value
-                (ark_bn254::Fq::rand(&mut rng), false)
-            };
-            let pt = ark_bn254::G1Affine::new_unchecked(x, y);
-
-            let input = OnlyCompressedG1Input(pt);
-            let out: crate::circuit::StreamingResult<_, _, Vec<bool>> =
-                CircuitBuilder::streaming_execute(input, 10_000, |ctx, wires| {
-                    let dec = decompress_g1_from_compressed(ctx, wires);
-                    vec![dec.is_valid]
-                });
-            let calc_is_valid = out.output_value[0];
-
-            assert_eq!(calc_is_valid, ref_is_valid);
-            assert_eq!(calc_is_valid, pt.is_on_curve());
-        }
-    }
-
-    #[test]
-    fn test_g2_compress_decompress_matches() {
-        let mut rng = ChaCha20Rng::seed_from_u64(222);
-        let r = ark_bn254::Fr::rand(&mut rng);
-        let p = (ark_bn254::G2Projective::generator() * r).into_affine();
-
-        let input = OnlyCompressedG2Input(p);
-
-        let out: crate::circuit::StreamingResult<_, _, Vec<bool>> =
-            CircuitBuilder::streaming_execute(input, 20_000, |ctx, wires| {
-                let res = decompress_g2_from_compressed(ctx, wires);
-                let dec = res.point;
-
-                let exp = G2Projective::as_montgomery(p.into_group());
-                let x_ok = Fq2Wire::equal_constant(ctx, &dec.x, &exp.x);
-                let z_ok = Fq2Wire::equal_constant(ctx, &dec.z, &exp.z);
-                // Compare y up to sign by checking y^2 equality
-                let y_sq = Fq2Wire::square_montgomery(ctx, &dec.y);
-                let exp_y_std = Fq2Wire::from_montgomery(exp.y);
-                let exp_y_sq_m = Fq2Wire::as_montgomery(exp_y_std.square());
-                let y_ok = Fq2Wire::equal_constant(ctx, &y_sq, &exp_y_sq_m);
-                vec![x_ok, y_ok, z_ok, res.is_valid]
-            });
-
-        assert!(out.output_value.iter().all(|&b| b));
-    }
-
-    #[test]
-    fn test_g2_decompress_failure() {
-        let mut rng = ChaCha20Rng::seed_from_u64(112);
-        for _ in 0..5 {
-            // sufficient sample size to sample both valid and invalid points
-            let x = ark_bn254::Fq2::rand(&mut rng);
-            let a1 = ark_bn254::Fq2::sqrt(&((x * x * x) + ark_bn254::g2::Config::COEFF_B));
-            let (y, ref_is_valid) = if let Some(a1) = a1 {
-                // if it is possible to take square root, you have found correct y,
-                (a1, true)
-            } else {
-                // else generate some random value
-                (ark_bn254::Fq2::rand(&mut rng), false)
-            };
-            let pt = ark_bn254::G2Affine::new_unchecked(x, y);
-
-            let input = OnlyCompressedG2Input(pt);
-            let out: crate::circuit::StreamingResult<_, _, Vec<bool>> =
-                CircuitBuilder::streaming_execute(input, 10_000, |ctx, wires| {
-                    let dec = decompress_g2_from_compressed(ctx, wires);
-                    vec![dec.is_valid]
-                });
-            let calc_is_valid = out.output_value[0];
-
-            assert_eq!(calc_is_valid, ref_is_valid);
-            assert_eq!(calc_is_valid, pt.is_on_curve());
-        }
-    }
-
     #[test]
     fn test_cofactor_clearing() {
         let mut rng = ChaCha20Rng::seed_from_u64(112);
@@ -1092,23 +777,22 @@ mod tests {
         let (pk, vk) = Groth16::<ark_bn254::Bn254>::setup(circuit, &mut rng).unwrap();
         let proof = Groth16::<ark_bn254::Bn254>::prove(&pk, circuit, &mut rng).unwrap();
 
-        let inputs = Groth16VerifyCompressedInput(Groth16VerifyInput {
+        let inputs = Groth16VerifyInput {
             public: vec![ark_bn254::Fr::from(0u64)], // unused here
             a: proof.a.into_group(),
             b: proof.b.into_group(),
             c: proof.c.into_group(),
             vk,
-        });
+        }
+        .compress();
 
         let out: crate::circuit::StreamingResult<_, _, Vec<bool>> =
             CircuitBuilder::streaming_execute(inputs, 80_000, |ctx, wires| {
-                let a = decompress_g1_from_compressed(ctx, &wires.a);
-                let b = decompress_g2_from_compressed(ctx, &wires.b);
-                let c = decompress_g1_from_compressed(ctx, &wires.c);
+                let proof_dec = wires.proof.deserialize_checked(ctx);
 
-                let a_dec = a.point;
-                let b_dec = b.point;
-                let c_dec = c.point;
+                let a_dec = proof_dec.a;
+                let b_dec = proof_dec.b;
+                let c_dec = proof_dec.c;
 
                 let a_exp = G1Projective::as_montgomery(proof.a.into_group());
                 let b_exp = G2Projective::as_montgomery(proof.b.into_group());
@@ -1127,8 +811,16 @@ mod tests {
                 let c_z_ok = Fq::equal_constant(ctx, &c_dec.z, &c_exp.z);
 
                 vec![
-                    a_x_ok, a_y_ok, a_z_ok, b_x_ok, b_y_ok, b_z_ok, c_x_ok, c_y_ok, c_z_ok,
-                    a.is_valid, b.is_valid, c.is_valid,
+                    a_x_ok,
+                    a_y_ok,
+                    a_z_ok,
+                    b_x_ok,
+                    b_y_ok,
+                    b_z_ok,
+                    c_x_ok,
+                    c_y_ok,
+                    c_z_ok,
+                    proof_dec.valid,
                 ]
             });
 
@@ -1343,5 +1035,47 @@ mod tests {
         assert!(!run_small_verify(VerifyFlow::Compressed, 80808, |inputs| {
             inputs.c.x += ark_bn254::Fq::ONE;
         }));
+    }
+
+    #[test]
+    fn test_ark_proof_decompress_matches() {
+        let ark_proof_bytes: [u8; 128] = [
+            55, 126, 31, 52, 68, 72, 45, 185, 179, 42, 69, 122, 227, 134, 234, 167, 80, 68, 65,
+            142, 134, 133, 97, 24, 194, 180, 193, 213, 111, 19, 12, 42, 142, 193, 123, 63, 163, 6,
+            122, 100, 126, 178, 41, 127, 97, 82, 169, 2, 30, 190, 130, 153, 110, 203, 2, 95, 89,
+            162, 70, 74, 63, 232, 176, 42, 39, 119, 13, 172, 154, 135, 98, 126, 217, 67, 36, 222,
+            136, 93, 161, 93, 1, 196, 101, 172, 163, 240, 105, 124, 107, 93, 222, 133, 118, 94,
+            161, 14, 165, 232, 61, 136, 121, 145, 0, 171, 184, 234, 57, 160, 1, 248, 7, 195, 124,
+            95, 50, 113, 24, 203, 211, 73, 196, 40, 173, 148, 179, 126, 12, 131,
+        ];
+        let ark_proof = ark_groth16::Proof::<ark_bn254::Bn254>::deserialize_compressed_unchecked(
+            &ark_proof_bytes[..],
+        )
+        .unwrap();
+        let ark_proof_bits: Vec<bool> = ark_proof_bytes
+            .iter()
+            .flat_map(|&b| (0..8).map(move |i| ((b >> i) & 1) == 1))
+            .collect();
+
+        let inputs = Groth16VerifyCompressedInput {
+            public: vec![],
+            proof: ark_proof_bits.try_into().unwrap(),
+            vk: ark_groth16::VerifyingKey::default(),
+        };
+
+        let result: StreamingResult<_, _, Vec<bool>> =
+            CircuitBuilder::streaming_execute(inputs, 80_000, |ctx, wires| {
+                let result_wires = wires.proof.deserialize_checked(ctx).b;
+                let mut output_ids = Vec::new();
+                output_ids.extend(result_wires.x.iter());
+                output_ids.extend(result_wires.y.iter());
+                output_ids.extend(result_wires.z.iter());
+                output_ids
+            });
+
+        let actual_result = G2Projective::from_bits_unchecked(result.output_value.clone());
+
+        let ark_proof_a_mont = G2Projective::as_montgomery(ark_proof.b.into());
+        assert_eq!(actual_result, ark_proof_a_mont);
     }
 }

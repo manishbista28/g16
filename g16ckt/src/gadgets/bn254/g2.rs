@@ -1,13 +1,14 @@
 use std::{cmp::min, collections::HashMap, iter::zip};
 
-use ark_ff::Zero;
+use ark_ec::short_weierstrass::SWCurveConfig;
+use ark_ff::{AdditiveGroup, Field, Zero};
 use circuit_component_macro::component;
 
 use crate::{
     CircuitContext, WireId,
     circuit::{FromWires, WiresArity, WiresObject},
     gadgets::{
-        bigint::Error,
+        bigint::{self, BigIntWires, Error},
         bn254::{fp254impl::Fp254Impl, fq::Fq, fq2::Fq2, fr::Fr},
     },
 };
@@ -524,6 +525,142 @@ impl G2Projective {
             z: p.z.clone(),
         }
     }
+
+    /// Deserialize into G1Projective from its 32 byte serialized bit representation.
+    pub fn deserialize_checked<C: CircuitContext>(
+        circuit: &mut C,
+        serialized_bits: [WireId; 64 * 8],
+    ) -> DecompressedG2Wires {
+        let (x, flag) = {
+            let byte_arr: Vec<[WireId; 8]> = serialized_bits
+                .chunks(8)
+                .map(|c| c.try_into().expect("chunk is exactly 8"))
+                .collect();
+            // flatten byte_array
+            let bit_arr: Vec<WireId> = byte_arr.into_iter().flatten().collect();
+            let (num1, num2, flag) = (
+                &bit_arr[0..Fq::N_BITS],
+                &bit_arr[32 * 8..32 * 8 + Fq::N_BITS],
+                &bit_arr[32 * 8 + Fq::N_BITS..],
+            );
+            let a = Fq2([
+                Fq(BigIntWires {
+                    bits: num1.to_vec(),
+                }),
+                Fq(BigIntWires {
+                    bits: num2.to_vec(),
+                }),
+            ]);
+
+            let r = Fq::as_montgomery(ark_bn254::Fq::ONE);
+            let a_mont_x = Fq::mul_by_constant_montgomery(circuit, a.c0(), &r.square());
+            let r = Fq::as_montgomery(ark_bn254::Fq::ONE);
+            let a_mont_y = Fq::mul_by_constant_montgomery(circuit, a.c1(), &r.square());
+
+            (Fq2([a_mont_x, a_mont_y]), flag.to_vec())
+        };
+
+        let y_neg_flag = circuit.issue_wire();
+        circuit.add_gate(crate::Gate {
+            wire_a: flag[0],
+            wire_b: flag[1],
+            wire_c: y_neg_flag,
+            gate_type: crate::GateType::Or,
+        });
+
+        let x2 = Fq2::square_montgomery(circuit, &x);
+
+        let x3 = Fq2::mul_montgomery(circuit, &x2, &x);
+
+        let y2 = Fq2::add_constant(
+            circuit,
+            &x3,
+            &Fq2::as_montgomery(ark_bn254::g2::Config::COEFF_B),
+        );
+
+        let y = Fq2::sqrt_general_montgomery(circuit, &y2);
+        let rhs_is_qr = {
+            // check if y * y == y2 to ensure rhs was a quadratic residue to begin with
+            let y_y = Fq2::square_montgomery(circuit, &y);
+
+            let match_c0 = bigint::equal(circuit, y2.c0(), y_y.c0());
+            let match_c1 = bigint::equal(circuit, y2.c1(), y_y.c1());
+            let match_c0_and_c1 = circuit.issue_wire();
+            circuit.add_gate(crate::Gate {
+                wire_a: match_c0,
+                wire_b: match_c1,
+                wire_c: match_c0_and_c1,
+                gate_type: crate::GateType::And,
+            });
+            match_c0_and_c1
+        };
+
+        let neg_y = Fq2::neg(circuit, y.clone());
+
+        let y_neg_greater = Fq2::greater_than(circuit, &neg_y, &y);
+        let tsy = {
+            let tsy_c0 = bigint::select(circuit, y.c0(), neg_y.c0(), y_neg_greater);
+            let tsy_c1 = bigint::select(circuit, y.c1(), neg_y.c1(), y_neg_greater);
+            Fq2([Fq(tsy_c0), Fq(tsy_c1)])
+        };
+        let tsy_neg = {
+            let tsy_neg_c0 = bigint::select(circuit, neg_y.c0(), y.c0(), y_neg_greater);
+            let tsy_neg_c1 = bigint::select(circuit, neg_y.c1(), y.c1(), y_neg_greater);
+            Fq2([Fq(tsy_neg_c0), Fq(tsy_neg_c1)])
+        };
+
+        let final_y_0 = bigint::select(circuit, tsy_neg.c0(), tsy.c0(), y_neg_flag);
+        let final_y_1 = bigint::select(circuit, tsy_neg.c1(), tsy.c1(), y_neg_flag);
+
+        // z = 1 in Montgomery
+        let one_m = Fq::as_montgomery(ark_bn254::Fq::ONE);
+        let zero_m = Fq::as_montgomery(ark_bn254::Fq::ZERO);
+
+        DecompressedG2Wires {
+            point: G2Projective {
+                x: x.clone(),
+                y: Fq2([Fq(final_y_0), Fq(final_y_1)]),
+                // In Fq2, ONE is (c0=1, c1=0). Use Montgomery representation.
+                z: Fq2([
+                    Fq::new_constant(&one_m).unwrap(),
+                    Fq::new_constant(&zero_m).unwrap(),
+                ]),
+            },
+            is_valid: rhs_is_qr,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompressedG2Wires {
+    pub p: Fq2,
+    pub y_flag: WireId,
+}
+
+impl CompressedG2Wires {
+    pub fn new(mut issue: impl FnMut() -> WireId) -> Self {
+        Self {
+            p: Fq2::new(&mut issue),
+            y_flag: issue(),
+        }
+    }
+}
+
+impl WiresObject for CompressedG2Wires {
+    fn to_wires_vec(&self) -> Vec<WireId> {
+        let Self { p, y_flag } = self;
+
+        let mut v = p.to_wires_vec();
+        v.push(*y_flag);
+        v
+    }
+
+    fn clone_from(&self, wire_gen: &mut impl FnMut() -> WireId) -> Self {
+        Self {
+            p: self.p.clone_from(wire_gen),
+            y_flag: self.y_flag.clone_from(wire_gen),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -564,8 +701,9 @@ impl WiresArity for DecompressedG2Wires {
 
 #[cfg(test)]
 mod tests {
-    use ark_ec::{CurveGroup, VariableBaseMSM};
+    use ark_ec::{CurveGroup, PrimeGroup, VariableBaseMSM};
     use ark_ff::{Field, UniformRand};
+    use ark_serialize::CanonicalSerialize;
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha20Rng;
 
@@ -936,5 +1074,74 @@ mod tests {
 
         let actual_result = G2Projective::from_bits_unchecked(circuit_result.output_value.clone());
         assert_eq!(actual_result, G2Projective::as_montgomery(result));
+    }
+
+    #[test]
+    fn test_g2_compress_decompress_matches() {
+        let mut rng = ChaCha20Rng::seed_from_u64(222);
+        let r = ark_bn254::Fr::rand(&mut rng);
+        let p = (ark_bn254::G2Projective::generator() * r).into_affine();
+
+        let mut p_bytes = Vec::new();
+        p.serialize_compressed(&mut p_bytes).unwrap();
+        let input: Vec<bool> = p_bytes
+            .iter()
+            .flat_map(|&b| (0..8).map(move |i| ((b >> i) & 1) == 1))
+            .collect();
+        let input: [bool; 64 * 8] = input.try_into().unwrap();
+
+        let out: crate::circuit::StreamingResult<_, _, Vec<bool>> =
+            CircuitBuilder::streaming_execute(input, 20_000, |ctx, wires| {
+                let res = G2Projective::deserialize_checked(ctx, *wires);
+                let dec = res.point;
+
+                let exp = G2Projective::as_montgomery(p.into());
+                let x_ok = Fq2::equal_constant(ctx, &dec.x, &exp.x);
+                let z_ok = Fq2::equal_constant(ctx, &dec.z, &exp.z);
+                // Compare y up to sign by checking y^2 equality
+                let y_sq = Fq2::square_montgomery(ctx, &dec.y);
+                let exp_y_std = Fq2::from_montgomery(exp.y);
+                let exp_y_sq_m = Fq2::as_montgomery(exp_y_std.square());
+                let y_ok = Fq2::equal_constant(ctx, &y_sq, &exp_y_sq_m);
+                vec![x_ok, y_ok, z_ok, res.is_valid]
+            });
+
+        assert!(out.output_value.iter().all(|&b| b));
+    }
+
+    #[test]
+    fn test_g2_decompress_failure() {
+        let mut rng = ChaCha20Rng::seed_from_u64(112);
+        for _ in 0..5 {
+            // sufficient sample size to sample both valid and invalid points
+            let x = ark_bn254::Fq2::rand(&mut rng);
+            let a1 = ark_bn254::Fq2::sqrt(&((x * x * x) + ark_bn254::g2::Config::COEFF_B));
+            let (y, ref_is_valid) = if let Some(a1) = a1 {
+                // if it is possible to take square root, you have found correct y,
+                (a1, true)
+            } else {
+                // else generate some random value
+                (ark_bn254::Fq2::rand(&mut rng), false)
+            };
+            let pt = ark_bn254::G2Affine::new_unchecked(x, y);
+
+            let mut p_bytes = Vec::new();
+            pt.serialize_compressed(&mut p_bytes).unwrap();
+            let input: Vec<bool> = p_bytes
+                .iter()
+                .flat_map(|&b| (0..8).map(move |i| ((b >> i) & 1) == 1))
+                .collect();
+            let input: [bool; 64 * 8] = input.try_into().unwrap();
+
+            let out: crate::circuit::StreamingResult<_, _, Vec<bool>> =
+                CircuitBuilder::streaming_execute(input, 10_000, |ctx, wires| {
+                    let dec = G2Projective::deserialize_checked(ctx, *wires);
+                    vec![dec.is_valid]
+                });
+            let calc_is_valid = out.output_value[0];
+
+            assert_eq!(calc_is_valid, ref_is_valid);
+            assert_eq!(calc_is_valid, pt.is_on_curve());
+        }
     }
 }
