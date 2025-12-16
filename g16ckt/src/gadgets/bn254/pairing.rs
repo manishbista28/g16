@@ -554,7 +554,9 @@ pub fn ell_coeffs_montgomery<C: CircuitContext>(
 
     let (new_r, _) = add_in_place_montgomery(circuit, &r, &q3);
 
-    // https://github.com/BitVM/BitVM/issues/191#issuecomment-2596825624
+    // Cheap subgroup check approach:
+    // https://eprint.iacr.org/2022/348.pdf Section 3.1.2 Remark 2
+    // `ark_bn254::Config::ATE_LOOP_COUNT` is `6z + 2` mentioned in the remark.
     let is_in_sg = {
         let z0 = new_r.z.c0();
 
