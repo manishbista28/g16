@@ -526,6 +526,37 @@ impl G2Projective {
         }
     }
 
+    /// check whether or not the point is on the curve or not
+    /// checks y^2=x^3+Bz^6 (Jacobian projective coordinates)
+    #[component]
+    pub fn is_on_curve<C: CircuitContext>(circuit: &mut C, p: &G2Projective) -> WireId {
+        let x2 = Fq2::square_montgomery(circuit, &p.x);
+        let x3 = Fq2::mul_montgomery(circuit, &p.x, &x2);
+        let y2 = Fq2::square_montgomery(circuit, &p.y);
+        let z2 = Fq2::square_montgomery(circuit, &p.z);
+        let z4 = Fq2::square_montgomery(circuit, &z2);
+        let z6 = Fq2::mul_montgomery(circuit, &z2, &z4);
+        let b_z6 = Fq2::mul_by_constant_montgomery(
+            circuit,
+            &z6,
+            &Fq2::as_montgomery(ark_bn254::g2::Config::COEFF_B),
+        );
+        let temp = Fq2::add(circuit, &x3, &b_z6);
+        let should_be_zero = Fq2::sub(circuit, &y2, &temp);
+        {
+            let c0 = bigint::equal_zero(circuit, should_be_zero.c0());
+            let c1 = bigint::equal_zero(circuit, should_be_zero.c1());
+            let is_zero = circuit.issue_wire();
+            circuit.add_gate(crate::Gate {
+                wire_a: c0,
+                wire_b: c1,
+                wire_c: is_zero,
+                gate_type: crate::GateType::And,
+            });
+            is_zero
+        }
+    }
+
     /// Deserialize into G2Projective from its 64 byte serialized bit representation.
     // Follows arkworks implementation here:
     // https://github.com/arkworks-rs/algebra/blob/v0.5.0/ec/src/models/short_weierstrass/mod.rs#L145
@@ -1201,5 +1232,38 @@ mod tests {
             assert_eq!(calc_is_valid, ref_is_valid);
             assert_eq!(calc_is_valid, pt.is_on_curve());
         }
+    }
+
+    #[test]
+    fn test_g2_is_on_curve() {
+        let mut rng = ChaCha20Rng::seed_from_u64(111);
+        let r = ark_bn254::G2Projective::rand(&mut rng);
+        let ref_is_on_curve = r.into_affine().is_on_curve();
+        let input = G2Input {
+            points: [G2Projective::as_montgomery(r)],
+        };
+        let out: crate::circuit::StreamingResult<_, _, Vec<bool>> =
+            CircuitBuilder::streaming_execute(input, 10_000, |ctx, wires| {
+                let is_on_curve = G2Projective::is_on_curve(ctx, &wires.points[0]);
+                vec![is_on_curve]
+            });
+        assert_eq!(out.output_value[0], ref_is_on_curve);
+
+        // not a point on curve
+        let r = ark_bn254::G2Projective::new_unchecked(
+            ark_bn254::Fq2::rand(&mut rng),
+            ark_bn254::Fq2::rand(&mut rng),
+            ark_bn254::Fq2::rand(&mut rng),
+        );
+        let input = G2Input {
+            points: [G2Projective::as_montgomery(r)],
+        };
+        let ref_is_on_curve = r.into_affine().is_on_curve();
+        let out: crate::circuit::StreamingResult<_, _, Vec<bool>> =
+            CircuitBuilder::streaming_execute(input, 10_000, |ctx, wires| {
+                let is_on_curve = G2Projective::is_on_curve(ctx, &wires.points[0]);
+                vec![is_on_curve]
+            });
+        assert_eq!(out.output_value[0], ref_is_on_curve);
     }
 }

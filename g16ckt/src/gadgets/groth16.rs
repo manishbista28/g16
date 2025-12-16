@@ -68,6 +68,28 @@ pub fn groth16_verify<C: CircuitContext>(
         vk,
     } = input;
 
+    let proof_is_on_curve = {
+        let a_is_on_curve = G1Projective::is_on_curve(circuit, a);
+        let b_is_on_curve = G2Projective::is_on_curve(circuit, b);
+        let c_is_on_curve = G1Projective::is_on_curve(circuit, c);
+
+        let tmp0 = circuit.issue_wire();
+        let tmp1 = circuit.issue_wire();
+        circuit.add_gate(crate::Gate {
+            wire_a: a_is_on_curve,
+            wire_b: b_is_on_curve,
+            wire_c: tmp0,
+            gate_type: crate::GateType::And,
+        });
+        circuit.add_gate(crate::Gate {
+            wire_a: tmp0,
+            wire_b: c_is_on_curve,
+            wire_c: tmp1,
+            gate_type: crate::GateType::And,
+        });
+        tmp1
+    };
+
     // Standard verification with public inputs
     // MSM: sum_i public[i] * gamma_abc_g1[i+1]
     let bases: Vec<ark_bn254::G1Projective> = vk
@@ -108,7 +130,16 @@ pub fn groth16_verify<C: CircuitContext>(
 
     let f = final_exponentiation_montgomery(circuit, &f);
 
-    Fq12::equal_constant(circuit, &f, &Fq12::as_montgomery(alpha_beta))
+    let finexp_match = Fq12::equal_constant(circuit, &f, &Fq12::as_montgomery(alpha_beta));
+
+    let valid = circuit.issue_wire();
+    circuit.add_gate(crate::Gate {
+        wire_a: finexp_match,
+        wire_b: proof_is_on_curve,
+        wire_c: valid,
+        gate_type: crate::GateType::And,
+    });
+    valid
 }
 
 /// Verify a 128-byte compressed serialized groth16 proof using public inputs
