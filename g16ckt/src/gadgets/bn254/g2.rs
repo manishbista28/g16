@@ -1,8 +1,9 @@
 use std::{cmp::min, collections::HashMap, iter::zip};
 
 use ark_ec::short_weierstrass::SWCurveConfig;
-use ark_ff::{AdditiveGroup, Field, Zero};
+use ark_ff::{AdditiveGroup, Field, PrimeField, Zero};
 use circuit_component_macro::component;
+use num_bigint::BigUint;
 
 use crate::{
     CircuitContext, WireId,
@@ -564,29 +565,40 @@ impl G2Projective {
         circuit: &mut C,
         serialized_bits: [WireId; 64 * 8],
     ) -> DecompressedG2Wires {
-        let (x, flag) = {
+        let (x, is_x_valid, flag) = {
             let (num1, num2, flag) = (
                 &serialized_bits[0..Fq::N_BITS],
                 &serialized_bits[32 * 8..32 * 8 + Fq::N_BITS],
                 &serialized_bits[32 * 8 + Fq::N_BITS..],
             );
-            let a = Fq2([
-                Fq(BigIntWires {
-                    bits: num1.to_vec(),
-                }),
-                Fq(BigIntWires {
-                    bits: num2.to_vec(),
-                }),
-            ]);
+            let a0 = BigIntWires {
+                bits: num1.to_vec(),
+            };
+            let a1 = BigIntWires {
+                bits: num2.to_vec(),
+            };
+            let r: BigUint = ark_bn254::Fq::MODULUS.into();
+            let valid_fq = {
+                let valid_a0 = bigint::less_than_constant(circuit, &a0, &r);
+                let valid_a1 = bigint::less_than_constant(circuit, &a1, &r);
+                let valid_fq = circuit.issue_wire();
+                circuit.add_gate(crate::Gate {
+                    wire_a: valid_a0,
+                    wire_b: valid_a1,
+                    wire_c: valid_fq,
+                    gate_type: crate::GateType::And,
+                });
+                valid_fq
+            };
 
             // convert input field element in standard form into montgomery form
             let r = Fq::as_montgomery(ark_bn254::Fq::ONE);
-            let a_mont_x = Fq::mul_by_constant_montgomery(circuit, a.c0(), &r.square());
+            let a_mont_x = Fq::mul_by_constant_montgomery(circuit, &Fq(a0), &r.square());
             let r = Fq::as_montgomery(ark_bn254::Fq::ONE);
-            let a_mont_y = Fq::mul_by_constant_montgomery(circuit, a.c1(), &r.square());
+            let a_mont_y = Fq::mul_by_constant_montgomery(circuit, &Fq(a1), &r.square());
 
             // flag_0 is lsb, flag 1 is msb
-            (Fq2([a_mont_x, a_mont_y]), [flag[0], flag[1]])
+            (Fq2([a_mont_x, a_mont_y]), valid_fq, [flag[0], flag[1]])
         };
 
         // Part 1: Extract Flags
@@ -696,13 +708,20 @@ impl G2Projective {
             // Input is invalid if input is not a valid point in the curve or deserialization error
             // valid only if both crieterion is met
             let tmp0 = circuit.issue_wire();
+            let tmp1 = circuit.issue_wire();
             circuit.add_gate(crate::Gate {
                 wire_a: rhs_is_qr,
                 wire_b: flags_is_valid,
                 wire_c: tmp0,
                 gate_type: crate::GateType::And,
             });
-            tmp0
+            circuit.add_gate(crate::Gate {
+                wire_a: tmp0,
+                wire_b: is_x_valid,
+                wire_c: tmp1,
+                gate_type: crate::GateType::And,
+            });
+            tmp1
         };
 
         DecompressedG2Wires {

@@ -1,8 +1,9 @@
 use std::{cmp::min, collections::HashMap, iter};
 
 use ark_ec::short_weierstrass::SWCurveConfig;
-use ark_ff::{Field, Zero};
+use ark_ff::{Field, PrimeField, Zero};
 use circuit_component_macro::component;
+use num_bigint::BigUint;
 
 use crate::{
     CircuitContext, WireId,
@@ -435,14 +436,17 @@ impl G1Projective {
         circuit: &mut C,
         serialized_bits: [WireId; 32 * 8],
     ) -> DecompressedG1Wires {
-        let (x_m, flag) = {
+        let (x_m, is_x_m_valid, flag) = {
             let (num, flag) = serialized_bits.split_at(Fq::N_BITS);
-            let a = Fq(BigIntWires { bits: num.to_vec() });
+            let a = BigIntWires { bits: num.to_vec() };
+            // check BigUint is a valid fq
+            let r: BigUint = ark_bn254::Fq::MODULUS.into();
+            let valid_fq = bigint::less_than_constant(circuit, &a, &r);
             // convert input field element in standard form into montgomery form
             let r = Fq::as_montgomery(ark_bn254::Fq::ONE);
-            let a_mont = Fq::mul_by_constant_montgomery(circuit, &a, &r.square());
+            let a_mont = Fq::mul_by_constant_montgomery(circuit, &Fq(a), &r.square());
             // flag_0 is lsb, flag 1 is msb
-            (a_mont, [flag[0], flag[1]])
+            (a_mont, valid_fq, [flag[0], flag[1]])
         };
 
         // Part 1: Extract Flags
@@ -532,13 +536,20 @@ impl G1Projective {
             // Input is invalid if input is not a valid point in the curve or deserialization error
             // valid only if both crieterion is met
             let tmp0 = circuit.issue_wire();
+            let tmp1 = circuit.issue_wire();
             circuit.add_gate(crate::Gate {
                 wire_a: rhs_is_qr,
                 wire_b: flags_is_valid,
                 wire_c: tmp0,
                 gate_type: crate::GateType::And,
             });
-            tmp0
+            circuit.add_gate(crate::Gate {
+                wire_a: tmp0,
+                wire_b: is_x_m_valid,
+                wire_c: tmp1,
+                gate_type: crate::GateType::And,
+            });
+            tmp1
         };
 
         DecompressedG1Wires {

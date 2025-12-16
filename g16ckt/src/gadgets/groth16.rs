@@ -6,7 +6,7 @@
 
 use ark_bn254::Bn254;
 use ark_ec::{AffineRepr, pairing::Pairing};
-use ark_ff::Field;
+use ark_ff::{Field, PrimeField};
 use ark_groth16::VerifyingKey;
 use ark_serialize::CanonicalSerialize;
 use circuit_component_macro::component;
@@ -14,9 +14,9 @@ use num_bigint::BigUint;
 
 use crate::{
     CircuitContext, WireId,
-    circuit::{CircuitInput, CircuitMode, EncodeInput, WiresObject},
+    circuit::{CircuitInput, CircuitMode, EncodeInput, TRUE_WIRE, WiresObject},
     gadgets::{
-        bigint::BigIntWires,
+        bigint::{self, BigIntWires},
         bn254::{
             G2Projective, final_exponentiation::final_exponentiation_montgomery, fq::Fq,
             fq12::Fq12, fr::Fr, g1::G1Projective,
@@ -68,26 +68,87 @@ pub fn groth16_verify<C: CircuitContext>(
         vk,
     } = input;
 
-    let proof_is_on_curve = {
-        let a_is_on_curve = G1Projective::is_on_curve(circuit, a);
-        let b_is_on_curve = G2Projective::is_on_curve(circuit, b);
-        let c_is_on_curve = G1Projective::is_on_curve(circuit, c);
+    let is_valid_field_and_group = {
+        let is_valid_fr = {
+            let mut and_all_wires = TRUE_WIRE;
+            public.iter().for_each(|pubinp| {
+                let r: BigUint = ark_bn254::Fr::MODULUS.into();
+                let valid_pubinp = bigint::less_than_constant(circuit, pubinp, &r);
+                let new_wire = circuit.issue_wire();
+                circuit.add_gate(crate::Gate {
+                    wire_a: and_all_wires,
+                    wire_b: valid_pubinp,
+                    wire_c: new_wire,
+                    gate_type: crate::GateType::And,
+                });
+                and_all_wires = new_wire;
+            });
+            and_all_wires
+        };
 
-        let tmp0 = circuit.issue_wire();
-        let tmp1 = circuit.issue_wire();
+        // Verify that all group elements of input proof include valid base field elements
+        let is_valid_fq = {
+            let elems = [
+                &a.x, &a.y, &a.z, &b.x.0[0], &b.x.0[1], &b.y.0[0], &b.y.0[1], &b.z.0[0], &b.z.0[1],
+                &c.x, &c.y, &c.z,
+            ];
+            let mut and_all_wires = TRUE_WIRE;
+            elems.iter().for_each(|pubinp| {
+                let r: BigUint = ark_bn254::Fq::MODULUS.into();
+                let valid_fq = bigint::less_than_constant(circuit, pubinp, &r);
+                let new_wire = circuit.issue_wire();
+                circuit.add_gate(crate::Gate {
+                    wire_a: and_all_wires,
+                    wire_b: valid_fq,
+                    wire_c: new_wire,
+                    gate_type: crate::GateType::And,
+                });
+                and_all_wires = new_wire;
+            });
+            and_all_wires
+        };
+
+        let is_on_curve = {
+            let a_is_on_curve = G1Projective::is_on_curve(circuit, a);
+            let b_is_on_curve = G2Projective::is_on_curve(circuit, b);
+            let c_is_on_curve = G1Projective::is_on_curve(circuit, c);
+
+            // valid group check
+            let tmp0 = circuit.issue_wire();
+            let is_on_curve = circuit.issue_wire();
+            circuit.add_gate(crate::Gate {
+                wire_a: a_is_on_curve,
+                wire_b: b_is_on_curve,
+                wire_c: tmp0,
+                gate_type: crate::GateType::And,
+            });
+            circuit.add_gate(crate::Gate {
+                wire_a: tmp0,
+                wire_b: c_is_on_curve,
+                wire_c: is_on_curve,
+                gate_type: crate::GateType::And,
+            });
+            is_on_curve
+        };
+
+        // valid fq and fr
+        let is_valid_field = circuit.issue_wire();
         circuit.add_gate(crate::Gate {
-            wire_a: a_is_on_curve,
-            wire_b: b_is_on_curve,
-            wire_c: tmp0,
+            wire_a: is_valid_fr,
+            wire_b: is_valid_fq,
+            wire_c: is_valid_field,
             gate_type: crate::GateType::And,
         });
+
+        // valid field and group check
+        let is_valid_field_and_group = circuit.issue_wire();
         circuit.add_gate(crate::Gate {
-            wire_a: tmp0,
-            wire_b: c_is_on_curve,
-            wire_c: tmp1,
+            wire_a: is_valid_field,
+            wire_b: is_on_curve,
+            wire_c: is_valid_field_and_group,
             gate_type: crate::GateType::And,
         });
-        tmp1
+        is_valid_field_and_group
     };
 
     // Standard verification with public inputs
@@ -135,7 +196,7 @@ pub fn groth16_verify<C: CircuitContext>(
     let valid = circuit.issue_wire();
     circuit.add_gate(crate::Gate {
         wire_a: finexp_match,
-        wire_b: proof_is_on_curve,
+        wire_b: is_valid_field_and_group,
         wire_c: valid,
         gate_type: crate::GateType::And,
     });
