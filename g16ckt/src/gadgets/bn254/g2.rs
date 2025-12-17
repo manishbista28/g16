@@ -520,7 +520,7 @@ impl G2Projective {
     pub fn neg<C: CircuitContext>(circuit: &mut C, p: &G2Projective) -> G2Projective {
         G2Projective {
             x: p.x.clone(),
-            y: Fq2::neg(circuit, p.y.clone()),
+            y: Fq2::neg(circuit, &p.y),
             z: p.z.clone(),
         }
     }

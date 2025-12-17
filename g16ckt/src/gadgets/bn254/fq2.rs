@@ -176,7 +176,7 @@ impl Fq2 {
         Fq2::from_components(c0, c1)
     }
 
-    pub fn neg<C: CircuitContext>(circuit: &mut C, a: Fq2) -> Fq2 {
+    pub fn neg<C: CircuitContext>(circuit: &mut C, a: &Fq2) -> Fq2 {
         assert_eq!(a.c0().len(), Self::N_BITS / 2);
         assert_eq!(a.c1().len(), Self::N_BITS / 2);
 
@@ -597,7 +597,7 @@ mod tests {
             10_000,
             |ctx, input| {
                 let [a] = input;
-                Fq2::neg(ctx, a.clone())
+                Fq2::neg(ctx, a)
             },
         );
 

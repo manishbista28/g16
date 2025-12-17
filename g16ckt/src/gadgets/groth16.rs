@@ -161,7 +161,7 @@ pub fn decompress_g2_from_compressed<C: CircuitContext>(
 
     let y = Fq2Wire::sqrt_general_montgomery(circuit, &y2);
 
-    let neg_y = Fq2Wire::neg(circuit, y.clone());
+    let neg_y = Fq2Wire::neg(circuit, &y);
 
     let final_y_0 = bigint::select(circuit, y.c0(), neg_y.c0(), *y_flag);
     let final_y_1 = bigint::select(circuit, y.c1(), neg_y.c1(), *y_flag);
