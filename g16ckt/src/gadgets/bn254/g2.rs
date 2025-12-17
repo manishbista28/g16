@@ -809,7 +809,7 @@ impl WiresArity for DecompressedG2Wires {
 
 #[cfg(test)]
 mod tests {
-    use ark_ec::{CurveGroup, PrimeGroup, VariableBaseMSM};
+    use ark_ec::{AffineRepr, CurveGroup, PrimeGroup, VariableBaseMSM};
     use ark_ff::{Field, UniformRand};
     use ark_serialize::CanonicalSerialize;
     use rand::{Rng, SeedableRng};
@@ -1284,5 +1284,38 @@ mod tests {
                 vec![is_on_curve]
             });
         assert_eq!(out.output_value[0], ref_is_on_curve);
+    }
+
+    #[test]
+    fn test_cofactor_clearing() {
+        let mut rng = ChaCha20Rng::seed_from_u64(112);
+        for _ in 0..5 {
+            // sufficient sample size to sample both valid and invalid points
+            let x = ark_bn254::Fq2::rand(&mut rng);
+            let a1 = ark_bn254::Fq2::sqrt(&((x * x * x) + ark_bn254::g2::Config::COEFF_B));
+            let (y, ref_is_valid) = if let Some(a1) = a1 {
+                // if it is possible to take square root, you have found correct y,
+                (a1, true)
+            } else {
+                // else generate some random value
+                (ark_bn254::Fq2::rand(&mut rng), false)
+            };
+            let pt = ark_bn254::G2Affine::new_unchecked(x, y);
+
+            let pt = pt.into_group();
+            const COFACTOR: &[u64] = &[
+                0x345f2299c0f9fa8d,
+                0x06ceecda572a2489,
+                0xb85045b68181585e,
+                0x30644e72e131a029,
+            ];
+            let pt = pt.mul_bigint(COFACTOR);
+            let pt = pt.into_affine();
+            // if it's a valid point, it should be on curve and subgroup (after cofactor clearing)
+            assert_eq!(
+                ref_is_valid,
+                pt.is_on_curve() && pt.is_in_correct_subgroup_assuming_on_curve()
+            );
+        }
     }
 }

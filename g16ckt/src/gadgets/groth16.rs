@@ -170,7 +170,7 @@ pub fn groth16_verify<C: CircuitContext>(
 
     let msm_affine = projective_to_affine_montgomery(circuit, &msm);
 
-    let f = multi_miller_loop_groth16_evaluate_montgomery_fast(
+    let miller_result = multi_miller_loop_groth16_evaluate_montgomery_fast(
         circuit,
         &msm_affine,  // p1
         c,            // p2
@@ -189,18 +189,26 @@ pub fn groth16_verify<C: CircuitContext>(
     .inverse()
     .unwrap();
 
-    let f = final_exponentiation_montgomery(circuit, &f);
+    let f = final_exponentiation_montgomery(circuit, &miller_result.f);
 
     let finexp_match = Fq12::equal_constant(circuit, &f, &Fq12::as_montgomery(alpha_beta));
 
-    let valid = circuit.issue_wire();
+    let valid_field_group_and_subgroup = circuit.issue_wire();
+    let all_valid = circuit.issue_wire();
     circuit.add_gate(crate::Gate {
-        wire_a: finexp_match,
+        wire_a: miller_result.is_valid,
         wire_b: is_valid_field_and_group,
-        wire_c: valid,
+        wire_c: valid_field_group_and_subgroup,
         gate_type: crate::GateType::And,
     });
-    valid
+
+    circuit.add_gate(crate::Gate {
+        wire_a: valid_field_group_and_subgroup,
+        wire_b: finexp_match,
+        wire_c: all_valid,
+        gate_type: crate::GateType::And,
+    });
+    all_valid
 }
 
 /// Verify a 128-byte compressed serialized groth16 proof using public inputs
