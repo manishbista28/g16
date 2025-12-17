@@ -892,6 +892,8 @@ name = "g16gen"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "ark-bn254",
+ "ark-groth16",
  "ckt",
  "cynosure 0.3.0",
  "g16ckt",
