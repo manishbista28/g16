@@ -142,16 +142,6 @@ impl Gate {
         }
     }
 
-    #[must_use]
-    pub fn not_with_xor(wire_a: WireId, wire_c: WireId) -> Self {
-        Self {
-            wire_a,
-            wire_b: TRUE_WIRE,
-            wire_c,
-            gate_type: GateType::Xor,
-        }
-    }
-
     /// Creates an AND-variant gate with configurable boolean function.                                                                                      │ │
     ///                                                                                                                                                      │ │
     /// This function implements the formula: `((a XOR f[0]) AND (b XOR f[1])) XOR f[2]`                                                                     │ │
