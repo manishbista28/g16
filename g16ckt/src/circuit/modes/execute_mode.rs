@@ -115,7 +115,7 @@ impl CircuitMode for ExecuteMode {
         self.storage
             .set(wire_id, |entry| {
                 assert!(
-                    entry.is_some(),
+                    entry.is_none(),
                     "overwriting wire_id {wire_id} value in storage"
                 );
                 *entry = Some(value)
