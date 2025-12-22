@@ -168,6 +168,15 @@ pub fn groth16_verify<C: CircuitContext>(
     let msm =
         G1Projective::add_montgomery(circuit, &msm_temp, &G1Projective::new_constant(&gamma0_m));
 
+    let tmp_non_invertible_msm = bigint::equal_zero(circuit, &msm.z);
+    let is_invertible_msm = circuit.issue_wire();
+    circuit.add_gate(crate::Gate {
+        wire_a: tmp_non_invertible_msm,
+        wire_b: TRUE_WIRE,
+        wire_c: is_invertible_msm,
+        gate_type: crate::GateType::Xor,
+    });
+
     let msm_affine = projective_to_affine_montgomery(circuit, &msm);
 
     let miller_result = multi_miller_loop_groth16_evaluate_montgomery_fast(
@@ -179,6 +188,13 @@ pub fn groth16_verify<C: CircuitContext>(
         -vk.delta_g2, // q2
         b,            // q3
     );
+    let is_valid_field_group_and_subgroup = circuit.issue_wire();
+    circuit.add_gate(crate::Gate {
+        wire_a: miller_result.is_valid,
+        wire_b: is_valid_field_and_group,
+        wire_c: is_valid_field_group_and_subgroup,
+        gate_type: crate::GateType::And,
+    });
 
     let alpha_beta = ark_bn254::Bn254::final_exponentiation(ark_bn254::Bn254::multi_miller_loop(
         [vk.alpha_g1.into_group()],
@@ -189,26 +205,39 @@ pub fn groth16_verify<C: CircuitContext>(
     .inverse()
     .unwrap();
 
-    let f = final_exponentiation_montgomery(circuit, &miller_result.f);
-
-    let finexp_match = Fq12::equal_constant(circuit, &f, &Fq12::as_montgomery(alpha_beta));
-
-    let valid_field_group_and_subgroup = circuit.issue_wire();
-    let all_valid = circuit.issue_wire();
+    let fin_exp = final_exponentiation_montgomery(circuit, &miller_result.f);
+    let is_invertible = circuit.issue_wire();
     circuit.add_gate(crate::Gate {
-        wire_a: miller_result.is_valid,
-        wire_b: is_valid_field_and_group,
-        wire_c: valid_field_group_and_subgroup,
+        wire_a: fin_exp.is_valid,  // input to finexp was invertible
+        wire_b: is_invertible_msm, // input to proj->affine was invertible
+        wire_c: is_invertible,
         gate_type: crate::GateType::And,
     });
 
-    circuit.add_gate(crate::Gate {
-        wire_a: valid_field_group_and_subgroup,
-        wire_b: finexp_match,
-        wire_c: all_valid,
-        gate_type: crate::GateType::And,
-    });
-    all_valid
+    let is_valid_proof =
+        Fq12::equal_constant(circuit, &fin_exp.f, &Fq12::as_montgomery(alpha_beta));
+
+    {
+        // merge
+        // #1: is valid field group and subgroup
+        // #2: is_valid inversion
+        // #3: is valid proof
+        let tmp0 = circuit.issue_wire();
+        circuit.add_gate(crate::Gate {
+            wire_a: is_valid_field_group_and_subgroup,
+            wire_b: is_invertible,
+            wire_c: tmp0,
+            gate_type: crate::GateType::And,
+        });
+        let all_valid = circuit.issue_wire();
+        circuit.add_gate(crate::Gate {
+            wire_a: tmp0,
+            wire_b: is_valid_proof,
+            wire_c: all_valid,
+            gate_type: crate::GateType::And,
+        });
+        all_valid
+    }
 }
 
 /// Verify a 128-byte compressed serialized groth16 proof using public inputs
