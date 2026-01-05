@@ -1,4 +1,4 @@
-use std::{cmp::min, collections::HashMap, iter::zip};
+use std::collections::HashMap;
 
 use ark_ff::Zero;
 use circuit_component_macro::component;
@@ -8,7 +8,7 @@ use crate::{
     circuit::{FromWires, WiresObject},
     gadgets::{
         bigint::Error,
-        bn254::{fp254impl::Fp254Impl, fq::Fq, fq2::Fq2, fr::Fr},
+        bn254::{fp254impl::Fp254Impl, fq::Fq, fq2::Fq2},
     },
 };
 
@@ -440,82 +440,6 @@ impl G2Projective {
         }
     }
 
-    #[component(offcircuit_args = "base")]
-    pub fn scalar_mul_by_constant_base_montgomery<C: CircuitContext, const W: usize>(
-        circuit: &mut C,
-        s: &Fr,
-        base: &ark_bn254::G2Projective,
-    ) -> G2Projective {
-        assert_eq!(s.len(), Fr::N_BITS);
-        let n = 2_usize.pow(W as u32);
-
-        let mut bases = Vec::new();
-        let mut p = ark_bn254::G2Projective::default();
-
-        for _ in 0..n {
-            bases.push(p);
-            p += base;
-        }
-
-        let mut bases_wires = bases
-            .iter()
-            .map(|p| G2Projective::new_constant(p).unwrap())
-            .collect::<Vec<_>>();
-
-        let mut to_be_added = Vec::new();
-
-        let mut index = 0;
-        while index < Fr::N_BITS {
-            let w = min(W, Fr::N_BITS - index);
-            let m = 2_usize.pow(w as u32);
-            let selector: Vec<WireId> = s.iter().skip(index).take(w).copied().collect();
-            let result = Self::multiplexer(circuit, &bases_wires[0..m], &selector, w);
-            to_be_added.push(result);
-            index += W;
-            let mut new_bases = Vec::new();
-            for b in bases {
-                let mut new_b = b;
-                for _ in 0..w {
-                    new_b = new_b + new_b;
-                }
-                new_bases.push(new_b);
-            }
-            bases = new_bases;
-            bases_wires = bases
-                .iter()
-                .map(|p| G2Projective::new_constant(p).unwrap())
-                .collect::<Vec<_>>();
-        }
-
-        let mut acc = to_be_added[0].clone();
-        for add in to_be_added.iter().skip(1) {
-            let new_acc = Self::add_montgomery(circuit, &acc, add);
-            acc = new_acc;
-        }
-
-        acc
-    }
-
-    pub fn msm_with_constant_bases_montgomery<const W: usize, C: CircuitContext>(
-        circuit: &mut C,
-        scalars: &Vec<Fr>,
-        bases: &Vec<ark_bn254::G2Projective>,
-    ) -> G2Projective {
-        assert_eq!(scalars.len(), bases.len());
-        let mut to_be_added = Vec::new();
-        for (s, base) in zip(scalars, bases) {
-            let result = Self::scalar_mul_by_constant_base_montgomery::<_, W>(circuit, s, base);
-            to_be_added.push(result);
-        }
-
-        let mut acc = to_be_added[0].clone();
-        for add in to_be_added.iter().skip(1) {
-            let new_acc = Self::add_montgomery(circuit, &acc, add);
-            acc = new_acc;
-        }
-        acc
-    }
-
     #[component]
     pub fn neg<C: CircuitContext>(circuit: &mut C, p: &G2Projective) -> G2Projective {
         G2Projective {
@@ -528,9 +452,8 @@ impl G2Projective {
 
 #[cfg(test)]
 mod tests {
-    use ark_ec::{CurveGroup, VariableBaseMSM};
     use ark_ff::UniformRand;
-    use rand::{Rng, SeedableRng};
+    use rand::{Rng, SeedableRng, thread_rng};
     use rand_chacha::ChaCha20Rng;
 
     use super::*;
@@ -545,7 +468,7 @@ mod tests {
     }
 
     pub fn rnd_g2(rng: &mut impl Rng) -> ark_bn254::G2Projective {
-        ark_bn254::G2Projective::default() * rnd_fr(rng)
+        ark_bn254::G2Projective::rand(rng) * rnd_fr(rng)
     }
 
     // Standardized input/output structures for G2 tests
@@ -597,45 +520,6 @@ mod tests {
         }
     }
 
-    pub struct ScalarInput<const N: usize> {
-        pub scalars: [ark_bn254::Fr; N],
-    }
-
-    pub struct ScalarInputWire<const N: usize> {
-        pub scalars: [Fr; N],
-    }
-
-    impl<const N: usize> CircuitInput for ScalarInput<N> {
-        type WireRepr = ScalarInputWire<N>;
-
-        fn allocate(&self, mut issue: impl FnMut() -> WireId) -> Self::WireRepr {
-            ScalarInputWire {
-                scalars: std::array::from_fn(|_| Fr::new(&mut issue)),
-            }
-        }
-
-        fn collect_wire_ids(repr: &Self::WireRepr) -> Vec<WireId> {
-            let mut wires = Vec::new();
-            for scalar in &repr.scalars {
-                wires.extend(scalar.iter().cloned());
-            }
-            wires
-        }
-    }
-
-    impl<const N: usize, M: CircuitMode<WireValue = bool>> EncodeInput<M> for ScalarInput<N> {
-        fn encode(&self, repr: &Self::WireRepr, cache: &mut M) {
-            for (scalar_wire, scalar_val) in repr.scalars.iter().zip(self.scalars.iter()) {
-                let scalar_fn = Fr::get_wire_bits_fn(scalar_wire, scalar_val).unwrap();
-                for &wire_id in scalar_wire.iter() {
-                    if let Some(bit) = scalar_fn(wire_id) {
-                        cache.feed_wire(wire_id, bit);
-                    }
-                }
-            }
-        }
-    }
-
     fn rnd() -> ark_bn254::G2Projective {
         use ark_ec::PrimeGroup;
         let g2 = ark_bn254::G2Projective::generator();
@@ -645,8 +529,9 @@ mod tests {
     #[test]
     fn test_g2p_add_montgomery() {
         // Generate random G2 points
-        let a = rnd_g2(&mut trng());
-        let b = rnd_g2(&mut trng());
+        let mut rng = thread_rng();
+        let a = rnd_g2(&mut rng);
+        let b = rnd_g2(&mut rng);
         let c = a + b;
 
         // Convert to Montgomery form
@@ -791,86 +676,5 @@ mod tests {
 
         let actual_result = G2Projective::from_bits_unchecked(result.output_value.clone());
         assert_eq!(actual_result, expected);
-    }
-
-    #[test]
-    fn test_g2p_scalar_mul_with_constant_base_montgomery() {
-        let s = rnd_fr(&mut trng());
-        let p = rnd_g2(&mut trng());
-        let result = p * s;
-
-        let inputs = ScalarInput { scalars: [s] };
-        let circuit_result: crate::circuit::StreamingResult<_, _, Vec<bool>> =
-            CircuitBuilder::streaming_execute(inputs, 10_000, |root, inputs_wire| {
-                let result_wires = G2Projective::scalar_mul_by_constant_base_montgomery::<_, 10>(
-                    root,
-                    &inputs_wire.scalars[0],
-                    &p,
-                );
-                result_wires.to_wires_vec()
-            });
-
-        let actual_result = G2Projective::from_bits_unchecked(circuit_result.output_value.clone());
-        assert_eq!(actual_result, G2Projective::as_montgomery(result));
-    }
-
-    #[test]
-    fn test_msm_with_constant_bases_montgomery() {
-        let n = 1;
-        let scalars = (0..n).map(|_| rnd_fr(&mut trng())).collect::<Vec<_>>();
-        let bases = (0..n).map(|_| rnd_g2(&mut trng())).collect::<Vec<_>>();
-        let bases_affine = bases.iter().map(|g| g.into_affine()).collect::<Vec<_>>();
-        let result = ark_bn254::G2Projective::msm(&bases_affine, &scalars).unwrap();
-
-        // Define input structure
-        struct MsmInputs {
-            scalars: Vec<ark_bn254::Fr>,
-        }
-        struct MsmInputsWire {
-            scalars: Vec<Fr>,
-        }
-        impl crate::circuit::CircuitInput for MsmInputs {
-            type WireRepr = MsmInputsWire;
-            fn allocate(&self, mut issue: impl FnMut() -> WireId) -> Self::WireRepr {
-                MsmInputsWire {
-                    scalars: (0..self.scalars.len())
-                        .map(|_| Fr::new(&mut issue))
-                        .collect(),
-                }
-            }
-
-            fn collect_wire_ids(repr: &Self::WireRepr) -> Vec<WireId> {
-                repr.scalars
-                    .iter()
-                    .flat_map(|fr| fr.iter().cloned())
-                    .collect()
-            }
-        }
-        impl<M: CircuitMode<WireValue = bool>> EncodeInput<M> for MsmInputs {
-            fn encode(&self, repr: &MsmInputsWire, cache: &mut M) {
-                for (fr_wire, fr_val) in repr.scalars.iter().zip(self.scalars.iter()) {
-                    let fr_fn = Fr::get_wire_bits_fn(fr_wire, fr_val).unwrap();
-                    for &wire_id in fr_wire.iter() {
-                        if let Some(bit) = fr_fn(wire_id) {
-                            cache.feed_wire(wire_id, bit);
-                        }
-                    }
-                }
-            }
-        }
-
-        let inputs = MsmInputs { scalars };
-        let circuit_result: crate::circuit::StreamingResult<_, _, Vec<bool>> =
-            CircuitBuilder::streaming_execute(inputs, 10_000, |root, inputs_wire| {
-                let result_wires = G2Projective::msm_with_constant_bases_montgomery::<10, _>(
-                    root,
-                    &inputs_wire.scalars,
-                    &bases,
-                );
-                result_wires.to_wires_vec()
-            });
-
-        let actual_result = G2Projective::from_bits_unchecked(circuit_result.output_value.clone());
-        assert_eq!(actual_result, G2Projective::as_montgomery(result));
     }
 }
