@@ -50,7 +50,7 @@ impl crate::circuit::FromWires for Fq2 {
     fn from_wires(wires: &[WireId]) -> Option<Self> {
         if wires.len() == Fq2::N_BITS {
             // 2 * 254 bits
-            let (fq1_wires, fq2_wires) = wires.split_at(254);
+            let (fq1_wires, fq2_wires) = wires.split_at(wires.len() / 2);
             let fq1 = Fq::from_wires(fq1_wires)?;
             let fq2 = Fq::from_wires(fq2_wires)?;
             Some(Self([fq1, fq2]))
