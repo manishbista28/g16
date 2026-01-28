@@ -536,6 +536,56 @@ pub fn groth16_verify_compressed_over_raw_public_input<const N: usize, C: Circui
     groth16_verify_compressed(circuit, &input_wires)
 }
 
+pub fn simple_circuit_substitute_for_groth16_verify_compressed_raw<
+    const N: usize,
+    C: CircuitContext,
+>(
+    circuit: &mut C,
+    input: &Groth16VerifyCompressedRawInputWires<N>,
+) -> crate::WireId {
+    // convert InputMessage<N> to scalar field elements
+    let out_hash = blake3_hash(circuit, input.public);
+    let hash_fr = convert_hash_to_bigint_wires(out_hash);
+
+    let proof = input.proof.deserialize_checked(circuit, input.proof_type);
+
+    // hash_fr and proof can not be zero
+    // proof.valid should be true
+    let mut wire_bits = vec![];
+    let mut proof_a = proof.a.to_wires_vec();
+    let mut proof_b = proof.b.to_wires_vec();
+    let mut proof_c = proof.c.to_wires_vec();
+    wire_bits.append(&mut proof_a);
+    wire_bits.append(&mut proof_b);
+    wire_bits.append(&mut proof_c);
+    let mut hash_fr = hash_fr[0].to_wires_vec();
+    wire_bits.append(&mut hash_fr);
+
+    let mut acc = wire_bits[0];
+    for w in &wire_bits[1..] {
+        let res = circuit.issue_wire();
+        circuit.add_gate(crate::Gate {
+            wire_a: acc,
+            wire_b: *w,
+            wire_c: res,
+            gate_type: crate::GateType::Or,
+        });
+        acc = res;
+    }
+    // acc is 1 if any of the bits is 1, else 0; so acc represents a highly likely criterion
+    // this way the wire value is mostly influenced by proof.valid
+    // all the while ensuring that all gates are used (no dangling wires)
+    let res = circuit.issue_wire();
+    circuit.add_gate(crate::Gate {
+        wire_a: acc,
+        wire_b: proof.valid,
+        wire_c: res,
+        gate_type: crate::GateType::And,
+    });
+
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;

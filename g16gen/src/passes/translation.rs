@@ -4,7 +4,8 @@ use g16ckt::{
     WireId,
     circuit::{StreamingMode, component_meta::ComponentMetaBuilder},
     gadgets::groth16::{
-        Groth16VerifyCompressedRawInput, groth16_verify_compressed_over_raw_public_input,
+        Groth16VerifyCompressedRawInput,
+        simple_circuit_substitute_for_groth16_verify_compressed_raw as groth16_fn,
     },
 };
 use tracing::info;
@@ -26,8 +27,7 @@ pub async fn run_translation_pass<const N: usize>(
     let metadata_start = Instant::now();
     // Run circuit construction in metadata mode
     let meta_output_wires = {
-        let ok =
-            groth16_verify_compressed_over_raw_public_input(&mut metadata_mode, &allocated_inputs);
+        let ok = groth16_fn(&mut metadata_mode, &allocated_inputs);
         vec![ok]
     };
     let metadata_time = metadata_start.elapsed();
@@ -50,7 +50,7 @@ pub async fn run_translation_pass<const N: usize>(
     let translation_start = Instant::now();
     // Run the translation pass
     let translation_output_wires = {
-        let ok = groth16_verify_compressed_over_raw_public_input(&mut ctx, &allocated_inputs);
+        let ok = groth16_fn(&mut ctx, &allocated_inputs);
         vec![ok]
     };
 
