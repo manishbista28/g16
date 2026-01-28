@@ -547,14 +547,18 @@ pub fn simple_circuit_substitute_for_groth16_verify_compressed_raw<
     let out_hash = blake3_hash(circuit, input.public);
     let hash_fr = convert_hash_to_bigint_wires(out_hash);
 
-    let proof = input.proof.deserialize_checked(circuit, input.proof_type);
+    let compressed_a: [WireId; 32 * 8] = input.proof.0[0..32 * 8].try_into().unwrap();
+    let compressed_b: [WireId; 64 * 8] = input.proof.0[32 * 8..96 * 8].try_into().unwrap();
+    let compressed_c: [WireId; 32 * 8] = input.proof.0[96 * 8..].try_into().unwrap();
+
+    let a_decomp = G1Projective::deserialize_checked(circuit, compressed_a, input.proof_type);
 
     // hash_fr and proof can not be zero
     // proof.valid should be true
     let mut wire_bits = vec![];
-    let mut proof_a = proof.a.to_wires_vec();
-    let mut proof_b = proof.b.to_wires_vec();
-    let mut proof_c = proof.c.to_wires_vec();
+    let mut proof_a = a_decomp.to_wires_vec();
+    let mut proof_b = compressed_b.to_vec();
+    let mut proof_c = compressed_c.to_vec();
     wire_bits.append(&mut proof_a);
     wire_bits.append(&mut proof_b);
     wire_bits.append(&mut proof_c);
@@ -578,7 +582,7 @@ pub fn simple_circuit_substitute_for_groth16_verify_compressed_raw<
     let res = circuit.issue_wire();
     circuit.add_gate(crate::Gate {
         wire_a: acc,
-        wire_b: proof.valid,
+        wire_b: a_decomp.is_valid,
         wire_c: res,
         gate_type: crate::GateType::And,
     });
