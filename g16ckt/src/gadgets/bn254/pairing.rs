@@ -570,7 +570,7 @@ pub fn ell_coeffs_montgomery<C: CircuitContext>(
             wire_c: z_is_zero,
             gate_type: crate::GateType::And,
         });
-        z0_is_zero
+        z_is_zero
     };
 
     (ellc, is_in_sg)
