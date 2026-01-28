@@ -72,8 +72,8 @@ pub fn groth16_verify<C: CircuitContext>(
         let is_valid_fr = {
             let mut and_all_wires = TRUE_WIRE;
             public.iter().for_each(|pubinp| {
-                let q: BigUint = ark_bn254::Fr::MODULUS.into();
-                let valid_pubinp = bigint::less_than_constant(circuit, pubinp, &q);
+                let r: BigUint = ark_bn254::Fr::MODULUS.into();
+                let valid_pubinp = bigint::less_than_constant(circuit, pubinp, &r);
                 let new_wire = circuit.issue_wire();
                 circuit.add_gate(crate::Gate {
                     wire_a: and_all_wires,
@@ -94,8 +94,8 @@ pub fn groth16_verify<C: CircuitContext>(
             ];
             let mut and_all_wires = TRUE_WIRE;
             elems.iter().for_each(|pubinp| {
-                let r: BigUint = ark_bn254::Fq::MODULUS.into();
-                let valid_fq = bigint::less_than_constant(circuit, pubinp, &r);
+                let q: BigUint = ark_bn254::Fq::MODULUS.into();
+                let valid_fq = bigint::less_than_constant(circuit, pubinp, &q);
                 let new_wire = circuit.issue_wire();
                 circuit.add_gate(crate::Gate {
                     wire_a: and_all_wires,
