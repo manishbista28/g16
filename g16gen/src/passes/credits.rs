@@ -3,10 +3,7 @@ use std::time::Instant;
 use g16ckt::{
     WireId,
     circuit::{StreamingMode, component_meta::ComponentMetaBuilder},
-    gadgets::groth16::{
-        Groth16VerifyCompressedRawInput,
-        simple_circuit_substitute_for_groth16_verify_compressed_raw as groth16_fn,
-    },
+    gadgets::groth16::{Groth16VerifyCompressedRawInput, simple_test_circuit as groth16_fn},
 };
 use tracing::info;
 

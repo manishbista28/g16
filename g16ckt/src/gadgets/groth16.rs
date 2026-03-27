@@ -536,34 +536,19 @@ pub fn groth16_verify_compressed_over_raw_public_input<const N: usize, C: Circui
     groth16_verify_compressed(circuit, &input_wires)
 }
 
-pub fn simple_circuit_substitute_for_groth16_verify_compressed_raw<
-    const N: usize,
-    C: CircuitContext,
->(
+pub fn simple_test_circuit<const N: usize, C: CircuitContext>(
     circuit: &mut C,
     input: &Groth16VerifyCompressedRawInputWires<N>,
 ) -> crate::WireId {
-    // convert InputMessage<N> to scalar field elements
-    let out_hash = blake3_hash(circuit, input.public);
-    let hash_fr = convert_hash_to_bigint_wires(out_hash);
+    const N_SETUP_INPUT_WIRES: usize = 32;
 
-    let compressed_a: [WireId; 32 * 8] = input.proof.0[0..32 * 8].try_into().unwrap();
-    let compressed_b: [WireId; 64 * 8] = input.proof.0[32 * 8..96 * 8].try_into().unwrap();
-    let compressed_c: [WireId; 32 * 8] = input.proof.0[96 * 8..].try_into().unwrap();
+    let mut proof_bits = input.proof.to_wires_vec();
+    let mut input_bits = input.public.to_wires_vec();
+    let deposit_input_lsb = input_bits[N_SETUP_INPUT_WIRES * 8]; // wire at lsb of deposit input
 
-    let a_decomp = G1Projective::deserialize_checked(circuit, compressed_a, input.proof_type);
-
-    // hash_fr and proof can not be zero
-    // proof.valid should be true
     let mut wire_bits = vec![];
-    let mut proof_a = a_decomp.to_wires_vec();
-    let mut proof_b = compressed_b.to_vec();
-    let mut proof_c = compressed_c.to_vec();
-    wire_bits.append(&mut proof_a);
-    wire_bits.append(&mut proof_b);
-    wire_bits.append(&mut proof_c);
-    let mut hash_fr = hash_fr[0].to_wires_vec();
-    wire_bits.append(&mut hash_fr);
+    wire_bits.append(&mut proof_bits);
+    wire_bits.append(&mut input_bits);
 
     let mut acc = wire_bits[0];
     for w in &wire_bits[1..] {
@@ -572,22 +557,27 @@ pub fn simple_circuit_substitute_for_groth16_verify_compressed_raw<
             wire_a: acc,
             wire_b: *w,
             wire_c: res,
-            gate_type: crate::GateType::Or,
+            gate_type: crate::GateType::And,
         });
         acc = res;
     }
-    // acc is 1 if any of the bits is 1, else 0; so acc represents a highly likely criterion
-    // this way the wire value is mostly influenced by proof.valid
-    // all the while ensuring that all gates are used (no dangling wires)
-    let res = circuit.issue_wire();
+
+    let acc_xor_itself = circuit.issue_wire();
     circuit.add_gate(crate::Gate {
         wire_a: acc,
-        wire_b: a_decomp.is_valid,
-        wire_c: res,
-        gate_type: crate::GateType::And,
+        wire_b: acc,
+        wire_c: acc_xor_itself,
+        gate_type: crate::GateType::Xor,
     });
 
-    res
+    let final_result = circuit.issue_wire();
+    circuit.add_gate(crate::Gate {
+        wire_a: acc_xor_itself,
+        wire_b: deposit_input_lsb,
+        wire_c: final_result,
+        gate_type: crate::GateType::Or,
+    });
+    final_result
 }
 
 #[cfg(test)]
@@ -603,7 +593,7 @@ mod tests {
     };
     use ark_serialize::CanonicalDeserialize;
     use ark_snark::{CircuitSpecificSetupSNARK, SNARK};
-    use rand::{Rng, SeedableRng};
+    use rand::{Rng, RngCore, SeedableRng};
     use rand_chacha::ChaCha20Rng;
     use test_log::test;
 
@@ -1280,8 +1270,7 @@ mod tests {
     fn convert_hash_to_bigint(raw_public_input_hash: blake3::Hash) -> ark_bn254::Fr {
         let mut raw_public_input_hash = *raw_public_input_hash.as_bytes();
         raw_public_input_hash[0] &= 0b00011111; // mask top 3 bits to fit within scalar field
-        let c_val = ark_bn254::Fr::from_be_bytes_mod_order(&raw_public_input_hash);
-        c_val
+        ark_bn254::Fr::from_be_bytes_mod_order(&raw_public_input_hash)
     }
 
     // verify groth16 proof end-to-end
@@ -1316,9 +1305,9 @@ mod tests {
         let ark_proof_bits: Vec<bool> = {
             let mut proof_bytes = Vec::new();
             ark_groth16::Proof::<Bn254> {
-                a: proof.a.into(),
-                b: proof.b.into(),
-                c: proof.c.into(),
+                a: proof.a,
+                b: proof.b,
+                c: proof.c,
             }
             .serialize_compressed(&mut proof_bytes)
             .expect("serialize proof");
@@ -1340,7 +1329,7 @@ mod tests {
 
         let out: StreamingResult<_, _, Vec<bool>> =
             CircuitBuilder::streaming_execute(inputs, 160_000, |ctx, wires| {
-                let ok = groth16_verify_compressed_over_raw_public_input(ctx, &wires);
+                let ok = groth16_verify_compressed_over_raw_public_input(ctx, wires);
                 vec![ok]
             });
 
@@ -1414,7 +1403,7 @@ mod tests {
 
         let out: StreamingResult<_, _, Vec<bool>> =
             CircuitBuilder::streaming_execute(inputs, 160_000, |ctx, wires| {
-                let ok = groth16_verify_compressed_over_raw_public_input(ctx, &wires);
+                let ok = groth16_verify_compressed_over_raw_public_input(ctx, wires);
                 vec![ok]
             });
 
@@ -1484,6 +1473,44 @@ mod tests {
         let out: StreamingResult<_, _, Vec<bool>> =
             CircuitBuilder::streaming_execute(inputs, 80_000, |ctx, wires| {
                 let ok = groth16_verify_compressed_over_raw_public_input(ctx, wires);
+                vec![ok]
+            });
+
+        assert!(out.output_value[0]);
+    }
+
+    #[test]
+    fn test_simple_circuit_substitute() {
+        const N_SETUP_INPUT_WIRES: usize = 32;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let mut proof_bytes: [u8; 128] = [0; 128];
+        rng.fill_bytes(&mut proof_bytes);
+        let proof_bits: Vec<bool> = proof_bytes
+            .iter()
+            .flat_map(|&b| (0..8).map(move |i| ((b >> i) & 1) == 1))
+            .collect();
+
+        let mut raw_public_input: [u8; 36] = [0; 36];
+        rng.fill_bytes(&mut raw_public_input);
+        raw_public_input[N_SETUP_INPUT_WIRES] = 0b00000001;
+
+        let mut vk_bytes: [u8; 328] = [0; 328];
+        rng.fill_bytes(&mut vk_bytes);
+
+        let vk: ark_groth16::VerifyingKey<ark_bn254::Bn254> = ark_groth16::VerifyingKey::default();
+        let inputs = Groth16VerifyCompressedRawInput {
+            public: InputMessage {
+                byte_arr: raw_public_input,
+            },
+            proof: proof_bits.try_into().unwrap(),
+            vk: vk.clone(),
+            proof_type: ProofType::GNARK,
+        };
+
+        let out: StreamingResult<_, _, Vec<bool>> =
+            CircuitBuilder::streaming_execute(inputs, 80_000, |ctx, wires| {
+                let ok = simple_test_circuit(ctx, wires);
                 vec![ok]
             });
 
